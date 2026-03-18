@@ -396,10 +396,18 @@ async def get_full_market_context(symbol: str, timeframe: str = "1h") -> str:
         logger.info("⚡ 正在从 WebSocket 内存池极速读取数据 (0 I/O 延迟)...")
         data = await ws_pool.get_market_data(symbol, timeframe)
         
-        ohlcv = data['ohlcv']
-        orderbook = data['orderbook']
-        ticker = data['ticker']
-        trades = data['trades']
+        ohlcv = data.get('ohlcv', [])
+        orderbook = data.get('orderbook', {'bids': [], 'asks': []})
+        ticker = data.get('ticker', {'last': 0.0})
+        trades = data.get('trades', [])
+        
+        # 增加防御性校验：如果蓄水失败，直接终止并通知 Agent
+        if not ohlcv or not orderbook.get('bids'):
+            logger.error(f"{symbol} 核心数据流缺失，无法进行矩阵运算。")
+            return json.dumps({
+                "error": "WebSocket 数据流尚未准备就绪",
+                "system_instruction": "🚨 底层数据流连接不稳定，无法获取完整行情。请停止尝试其他参数，立刻输出 <ACTION>WAIT</ACTION> 并结束本次分析。"
+            }, ensure_ascii=False)
         
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         

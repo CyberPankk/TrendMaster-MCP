@@ -57,12 +57,13 @@ def get_exchange_config():
         
     return config
 
-@mcp.tool()
+# @mcp.tool()
 async def get_ticker(symbol: str) -> str:
     """
-    获取指定交易对的实时行情信息。
+    [Agent 工具] 获取指定交易对（如 BTC/USDT）的最新市场行情 (Ticker)。
     """
-    logger.info(f"Received request to get ticker for symbol: {symbol}")
+    start_time = time.time()
+    logger.info(f"Received request for get_ticker: {symbol}")
     
     # 初始化 ccxt binance 异步客户端
     config = get_exchange_config()
@@ -122,7 +123,7 @@ async def get_ticker(symbol: str) -> str:
         # 确保释放和关闭异步连接，防止资源泄露
         await exchange.close()
 
-@mcp.tool()
+# @mcp.tool()
 async def get_orderbook_ofi(symbol: str) -> str:
     """
     获取指定交易对的盘口数据，计算订单流不平衡指标 (OFI) 并生成自然语言描述。

@@ -185,6 +185,7 @@ class TrendMasterAgent:
             while True:
                 user_input = input(f"\n{Fore.BLUE}🧑‍💻 长官，请下达指令 (输入 'exit' 退出): {Style.RESET_ALL}")
                 if user_input.lower() in ['exit', 'quit']:
+                    self.memory_stream._save_db() # 退出前强制保存一次记忆
                     break
                 if not user_input.strip():
                     continue
@@ -196,9 +197,40 @@ class TrendMasterAgent:
                 elif "BTC" in user_input.upper():
                     symbol_to_analyze = "BTC/USDT"
                     
+                # ==========================================
+                # 🚀 优化点：数据前置注入 (绕过 LLM 的工具选择)
+                # ==========================================
+                logger.info(f"{Fore.YELLOW}⚡ 绕过 LLM 路由，客户端直接并发请求 Fat-Tool 数据...{Style.RESET_ALL}")
+                
+                # 直接通过 session.call_tool 获取脱水数据
+                fat_data = "获取失败"
+                if "get_full_market_context" in self.tool_routing_map:
+                    session = self.tool_routing_map["get_full_market_context"]
+                    try:
+                        # 显式重置超时时间，防止底层MCP调用被挂起
+                        # 这里使用了 asyncio.wait_for 来防止 session.call_tool 永久卡死
+                        result = await asyncio.wait_for(
+                            session.call_tool("get_full_market_context", arguments={"symbol": symbol_to_analyze, "timeframe": "1h"}),
+                            timeout=15.0
+                        )
+                        fat_data = result.content[0].text
+                        logger.info(f"{Fore.GREEN}✅ 极速脱水数据已获取，准备组装终极 Prompt{Style.RESET_ALL}")
+                    except Exception as e:
+                        logger.error(f"直接调用 Fat-Tool 失败: {e}")
+                        fat_data = f"调用失败: {e}"
+                else:
+                    logger.error("未找到 get_full_market_context 工具的路由映射")
+                    
                 # 注入前置记忆
                 past_memory = self.memory_stream.get_last_memory(symbol_to_analyze)
-                enriched_input = f"{past_memory}\n\n当前指令：{user_input}\n请结合历史记忆进行连贯性分析。"
+                
+                # 组装终极 Prompt
+                enriched_input = (
+                    f"{past_memory}\n\n"
+                    f"【系统强制注入的底层数据】\n{fat_data}\n\n"
+                    f"当前长官指令：{user_input}\n"
+                    f"请直接根据上述数据输出最终交易决策，严禁调用任何外部工具！"
+                )
                     
                 # 统一添加 User Message
                 if self.llm_provider == "deepseek":
@@ -212,140 +244,86 @@ class TrendMasterAgent:
                 # 暂存大模型回复，用于写入记忆
                 final_reply_content = ""
 
-                while True:
-                    logger.info(f"{Fore.CYAN}🧠 Agent 正在思考...{Style.RESET_ALL}")
-                    
-                    try:
-                        if self.llm_provider == "anthropic":
-                            # Anthropic 调用逻辑
-                            response = await self.anthropic.messages.create(
-                                model="claude-3-5-sonnet-20241022",
-                                max_tokens=4096,
-                                system=system_prompt,
-                                messages=anthropic_messages,
-                                tools=self.available_tools
-                            )
-                            # 记录 Assistant 的完整回复
-                            anthropic_messages.append({"role": "assistant", "content": response.content})
-                            
-                            tool_calls = [block for block in response.content if block.type == "tool_use"]
-                            text_blocks = [block.text for block in response.content if block.type == "text"]
-                            if text_blocks:
-                                final_reply_content = text_blocks[0]
-                                print(f"\n{Fore.MAGENTA}🤖 TrendMaster:{Style.RESET_ALL} {text_blocks[0]}")
-                                
-                        elif self.llm_provider == "deepseek":
-                            # DeepSeek 调用逻辑
-                            response_msg = await self.deepseek.chat_completion(
-                                messages=messages,
-                                tools=self.available_tools
-                            )
-                            # 记录 Assistant 回复
-                            messages.append(response_msg) # response_msg 是 OpenAI 格式的对象或字典
-                            
-                            tool_calls = response_msg.tool_calls # OpenAI 格式的 tool_calls
-                            if response_msg.content:
-                                final_reply_content = response_msg.content
-                                print(f"\n{Fore.MAGENTA}🤖 TrendMaster:{Style.RESET_ALL} {response_msg.content}")
-
-                        # -----------------------------------------------------
-                        # 统一处理 Tool Calls
-                        # -----------------------------------------------------
-                        if not tool_calls:
-                            # 循环结束，归档记忆
-                            if final_reply_content:
-                                self.memory_stream.update_memory(symbol_to_analyze, final_reply_content)
-                            break # 无工具调用，结束本轮对话
-                            
-                        # 如果有 Tool Calls，执行它们并将结果返还给大模型
-                        tool_results = []
+                logger.info(f"{Fore.CYAN}🧠 Agent 正在进行 One-Shot 极速推理...{Style.RESET_ALL}")
+                print(f"\n{Fore.MAGENTA}🤖 TrendMaster: {Style.RESET_ALL}", end="", flush=True)
+                
+                try:
+                    if self.llm_provider == "anthropic":
+                        # Anthropic 流式调用逻辑
+                        response_stream = await self.anthropic.messages.create(
+                            model="claude-3-5-sonnet-20241022",
+                            max_tokens=4096,
+                            system=system_prompt,
+                            messages=anthropic_messages,
+                            stream=True
+                        )
                         
-                        # Anthropic 和 OpenAI 的 tool_calls 结构略有不同，需要适配
-                        normalized_tool_calls = []
-                        if self.llm_provider == "anthropic":
-                            for tc in tool_calls:
-                                normalized_tool_calls.append({
-                                    "id": tc.id,
-                                    "name": tc.name,
-                                    "args": tc.input,
-                                    "original": tc
-                                })
-                        else: # deepseek (OpenAI format)
-                            for tc in tool_calls:
-                                normalized_tool_calls.append({
-                                    "id": tc.id,
-                                    "name": tc.function.name,
-                                    "args": json.loads(tc.function.arguments),
-                                    "original": tc
-                                })
-
-                        for tc in normalized_tool_calls:
-                            tool_name = tc["name"]
-                            tool_args = tc["args"]
-                            tool_id = tc["id"]
-                            
-                            # 路由逻辑
-                            session = self.tool_routing_map.get(tool_name)
-                            if not session:
-                                error_msg = f"找不到工具 {tool_name} 对应的 MCP Server。"
-                                logger.error(error_msg)
-                                tool_results.append({
-                                    "tool_use_id": tool_id,
-                                    "content": error_msg,
-                                    "is_error": True
-                                })
-                                continue
+                        async for event in response_stream:
+                            if event.type == "text_delta":
+                                text = event.delta.text
+                                print(text, end="", flush=True)
+                                final_reply_content += text
                                 
-                            logger.info(f"{Fore.YELLOW}📡 [Router] 路由 tool '{tool_name}' 至对应的 MCP Server...{Style.RESET_ALL}")
-                            logger.info(f"   参数: {json.dumps(tool_args, ensure_ascii=False)}")
-                            
-                            try:
-                                # 发起 RPC 调用
-                                result = await session.call_tool(tool_name, arguments=tool_args)
-                                result_text = result.content[0].text if result.content else "No Output"
-                                
-                                logger.info(f"{Fore.GREEN}🟢 [Router] 工具 '{tool_name}' 执行成功。{Style.RESET_ALL}")
-                                
-                                tool_results.append({
-                                    "tool_use_id": tool_id,
-                                    "content": result_text,
-                                    "is_error": False
-                                })
-                            except Exception as e:
-                                logger.error(f"🔴 [Router] 工具 '{tool_name}' 执行报错: {e}")
-                                tool_results.append({
-                                    "tool_use_id": tool_id,
-                                    "content": str(e),
-                                    "is_error": True
-                                })
+                        anthropic_messages.append({"role": "assistant", "content": final_reply_content})
                         
-                        # 将结果回传给 LLM
-                        if self.llm_provider == "anthropic":
-                            # Anthropic 格式回传
-                            content_list = []
-                            for tr in tool_results:
-                                content_list.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": tr["tool_use_id"],
-                                    "content": tr["content"],
-                                    "is_error": tr.get("is_error", False)
-                                })
-                            anthropic_messages.append({"role": "user", "content": content_list})
-                            
-                        elif self.llm_provider == "deepseek":
-                            # OpenAI 格式回传
-                            for tr in tool_results:
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tr["tool_use_id"],
-                                    "content": tr["content"]
-                                })
+                    elif self.llm_provider == "deepseek":
+                        # DeepSeek 流式调用逻辑
+                        response_stream = await self.deepseek.chat_completion(
+                            messages=messages
+                        )
+                        
+                        async for chunk in response_stream:
+                            if chunk.choices and chunk.choices[0].delta.content:
+                                text = chunk.choices[0].delta.content
+                                print(text, end="", flush=True)
+                                final_reply_content += text
+                                
+                        messages.append({"role": "assistant", "content": final_reply_content})
+                        
+                    print("\n") # 换行收尾
 
-                    except Exception as e:
-                        logger.error(f"大模型通信或处理失败: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        break
+                    # -----------------------------------------------------
+                    # 🚀 客户端直连执行 (Action Interception)
+                    # -----------------------------------------------------
+                    if final_reply_content:
+                        self.memory_stream.update_memory(symbol_to_analyze, final_reply_content)
+                        
+                        # 正则提取 ACTION
+                        action_match = re.search(r'<ACTION>([A-Z]+)</ACTION>', final_reply_content, re.IGNORECASE)
+                        action = action_match.group(1).upper() if action_match else None
+                        
+                        if action in ["BUY", "SELL"]:
+                            logger.info(f"{Fore.YELLOW}⚔️ 捕获到交易指令 [{action}]，Python 客户端接管执行流程...{Style.RESET_ALL}")
+                            # 固定下单 500 USDT (您可以根据需要通过正则进一步提取金额，这里按要求执行一笔固定数量交易，或默认 500)
+                            # 从 user_input 提取金额
+                            amount_match = re.search(r'(\d+)\s*USDT', user_input, re.IGNORECASE)
+                            amount_usd = float(amount_match.group(1)) if amount_match else 500.0
+                            
+                            if "execute_smart_order" in self.tool_routing_map:
+                                exec_session = self.tool_routing_map["execute_smart_order"]
+                                try:
+                                    logger.info(f"{Fore.YELLOW}🚀 发往下单工具: symbol={symbol_to_analyze}, side={action.lower()}, amount={amount_usd}{Style.RESET_ALL}")
+                                    # 使用 asyncio.wait_for 防止订单执行卡死
+                                    exec_result = await asyncio.wait_for(
+                                        exec_session.call_tool("execute_smart_order", arguments={
+                                            "symbol": symbol_to_analyze, 
+                                            "side": action.lower(), 
+                                            "amount_usd": amount_usd
+                                        }),
+                                        timeout=10.0
+                                    )
+                                    logger.info(f"{Fore.GREEN}✅ 交易执行结果: {exec_result.content[0].text}{Style.RESET_ALL}")
+                                except Exception as e:
+                                    logger.error(f"❌ 交易执行失败: {e}")
+                            else:
+                                logger.error("未找到 execute_smart_order 工具的路由映射")
+                        elif action == "WAIT":
+                            logger.info(f"{Fore.BLUE}⏳ 收到观望指令，本轮分析结束。{Style.RESET_ALL}")
+                        else:
+                            logger.warn(f"⚠️ 未能从模型输出中提取到标准的 <ACTION> 标签。")
+
+                except Exception as e:
+                    logger.error(f"大模型通信或处理失败: {e}")
 
         except Exception as e:
             logger.error(f"Agent 初始化失败: {e}")

@@ -116,14 +116,15 @@ class DeepSeekAdapter:
         
         # 3. 发起请求
         try:
+            # 移除 kwargs 中不支持的参数 (如果需要流式输出，可以增加 stream=True 参数处理)
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=openai_messages,
-                tools=openai_tools,
-                # DeepSeek V3 特定参数
-                # temperature=0.7,
+                # 不再传递 tools，因为在 One-Shot 模式下大模型被剥夺了工具权限
+                # tools=openai_tools,
+                stream=True # 强制开启流式输出
             )
-            return response.choices[0].message
+            return response
         except Exception as e:
             logger.error(f"DeepSeek API 请求失败: {e}")
             raise e

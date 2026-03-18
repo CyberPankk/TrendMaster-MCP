@@ -13,6 +13,10 @@ agent_memory.json
 # Private Documentation
 Docs/
 
+# Test files
+test_*.py
+system_integration_test.py
+
 # Python
 __pycache__/
 *.py[cod]

@@ -10,6 +10,9 @@ logs/
 # Agent Memory
 agent_memory.json
 
+# Private Documentation
+Docs/
+
 # Python
 __pycache__/
 *.py[cod]

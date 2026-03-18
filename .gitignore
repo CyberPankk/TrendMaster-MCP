@@ -1,0 +1,33 @@
+# Environment Variables
+.env
+.env.local
+.env.production
+
+# Logs
+logs/
+*.log
+
+# Agent Memory
+agent_memory.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+env/
+.venv/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo

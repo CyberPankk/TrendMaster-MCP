@@ -8,7 +8,7 @@ root_dir = Path(__file__).parent.parent.parent
 sys.path.append(str(root_dir))
 
 # 加载环境变量
-load_dotenv(root_dir / ".env")
+load_dotenv(root_dir / ".env", override=True)
 
 import ccxt.async_support as ccxt
 from mcp.server.fastmcp import FastMCP

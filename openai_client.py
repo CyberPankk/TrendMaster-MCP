@@ -7,16 +7,23 @@ logger = get_logger("OpenAI-Adapter")
 
 class DeepSeekAdapter:
     """
-    适配 SiliconFlow (DeepSeek) 的 OpenAI 格式接口。
-    用于替代 Anthropic 客户端，实现 Tool Calling 的逻辑转换。
+    适配兼容 OpenAI 格式接口的 LLM 提供商 (如 SiliconFlow 的 DeepSeek，或 Ofox 的 GPT-5.4-Mini)。
+    用于替代 Anthropic 客户端，实现统一的调用逻辑。
     """
-    def __init__(self):
-        self.api_key = os.getenv("SILICONFLOW_API_KEY")
-        self.base_url = os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
-        self.model = os.getenv("SILICONFLOW_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2")
+    def __init__(self, provider="deepseek"):
+        self.provider = provider
+        
+        if provider == "ofox":
+            self.api_key = os.getenv("OFOX_API_KEY")
+            self.base_url = os.getenv("OFOX_BASE_URL", "https://api.ofox.ai/v1")
+            self.model = os.getenv("OFOX_MODEL", "openai/gpt-5.4-mini")
+        else:
+            self.api_key = os.getenv("SILICONFLOW_API_KEY")
+            self.base_url = os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+            self.model = os.getenv("SILICONFLOW_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2")
         
         if not self.api_key:
-            logger.error("未找到 SILICONFLOW_API_KEY，DeepSeek 适配器无法初始化！")
+            logger.error(f"未找到 {provider.upper()}_API_KEY，适配器无法初始化！")
             
         self.client = AsyncOpenAI(
             api_key=self.api_key,
@@ -56,7 +63,7 @@ class DeepSeekAdapter:
             })
         return openai_tools
 
-    async def chat_completion(self, messages: list, tools: list = None):
+    async def chat_completion(self, messages: list, tools: list = None, stream: bool = True):
         """
         发送聊天请求，兼容 Anthropic 的 message 格式。
         """
@@ -122,9 +129,9 @@ class DeepSeekAdapter:
                 messages=openai_messages,
                 # 不再传递 tools，因为在 One-Shot 模式下大模型被剥夺了工具权限
                 # tools=openai_tools,
-                stream=True # 强制开启流式输出
+                stream=stream # 可选流式输出
             )
             return response
         except Exception as e:
-            logger.error(f"DeepSeek API 请求失败: {e}")
+            logger.error(f"{self.provider.upper()} API 请求失败: {e}")
             raise e

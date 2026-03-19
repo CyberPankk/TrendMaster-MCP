@@ -21,7 +21,7 @@ from openai_client import DeepSeekAdapter # 导入适配器
 init(autoreset=True)
 
 # 加载环境变量
-load_dotenv()
+load_dotenv(override=True)
 
 logger = get_logger("Agent-Client")
 
@@ -79,13 +79,17 @@ class TrendMasterAgent:
         logger.info(f"🚀 当前使用的 LLM 提供商: {Fore.GREEN}{self.llm_provider.upper()}{Style.RESET_ALL}")
 
         if self.llm_provider == "anthropic":
-            self.anthropic = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-            if not self.anthropic.api_key:
-                logger.error("未找到 ANTHROPIC_API_KEY 环境变量！")
-        elif self.llm_provider == "deepseek":
-            self.deepseek = DeepSeekAdapter()
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+            if not api_key:
+                logger.error("未找到 ANTHROPIC_API_KEY，请检查 .env 文件")
+                sys.exit(1)
+            self.anthropic = AsyncAnthropic(api_key=api_key)
+        elif self.llm_provider in ["deepseek", "ofox"]:
+            # 使用 OpenAI 兼容适配器
+            self.deepseek = DeepSeekAdapter(provider=self.llm_provider)
         else:
-            logger.error(f"不支持的 LLM 提供商: {self.llm_provider}")
+            logger.error(f"不支持的 LLM_PROVIDER: {self.llm_provider}")
+            sys.exit(1)
             
         # 记录 tool_name 对应哪个 MCP Session
         self.tool_routing_map: Dict[str, ClientSession] = {} 
@@ -160,6 +164,33 @@ class TrendMasterAgent:
 
         logger.info(f"共加载了 {len(self.available_tools)} 个可用工具。")
 
+    async def call_mcp_tool_directly(self, server_name: str, tool_name: str, arguments: dict) -> str:
+        """
+        绕过 LLM，直接调用 MCP Tool
+        Args:
+            server_name: 仅用于日志记录，实际路由通过 tool_name 查找
+            tool_name: MCP 工具名称
+            arguments: 工具参数字典
+        """
+        if tool_name not in self.tool_routing_map:
+            error_msg = f"未找到工具 {tool_name} 的路由映射"
+            logger.error(error_msg)
+            return error_msg
+
+        session = self.tool_routing_map[tool_name]
+        try:
+            logger.info(f"⚡ [{server_name}] 直接调用工具: {tool_name} args={arguments}")
+            # 设置 15s 超时防止卡死
+            result = await asyncio.wait_for(
+                session.call_tool(tool_name, arguments=arguments),
+                timeout=15.0
+            )
+            # result.content 是一个列表，通常第一个元素包含文本
+            return result.content[0].text
+        except Exception as e:
+            logger.error(f"直接调用 {tool_name} 失败: {e}")
+            return f"调用失败: {str(e)}"
+
     async def run_chat_loop(self):
         """启动 Agent 交互主循环"""
         try:
@@ -171,7 +202,7 @@ class TrendMasterAgent:
             
             # OpenAI 格式需要将 system prompt 放入 messages 列表
             messages = []
-            if self.llm_provider == "deepseek":
+            if self.llm_provider in ["deepseek", "ofox"]:
                 messages.append({"role": "system", "content": system_prompt})
             
             logger.info("\n" + "="*60)
@@ -233,7 +264,7 @@ class TrendMasterAgent:
                 )
                     
                 # 统一添加 User Message
-                if self.llm_provider == "deepseek":
+                if self.llm_provider in ["deepseek", "ofox"]:
                     messages.append({"role": "user", "content": enriched_input})
                 else:
                     anthropic_messages.append({"role": "user", "content": enriched_input})
@@ -266,8 +297,8 @@ class TrendMasterAgent:
                                 
                         anthropic_messages.append({"role": "assistant", "content": final_reply_content})
                         
-                    elif self.llm_provider == "deepseek":
-                        # DeepSeek 流式调用逻辑
+                    elif self.llm_provider in ["deepseek", "ofox"]:
+                        # OpenAI 兼容流式调用逻辑
                         response_stream = await self.deepseek.chat_completion(
                             messages=messages
                         )

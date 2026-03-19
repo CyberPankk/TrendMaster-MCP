@@ -12,7 +12,7 @@ root_dir = Path(__file__).parent.parent.parent
 sys.path.append(str(root_dir))
 
 # 加载 .env 环境变量
-load_dotenv(root_dir / ".env")
+load_dotenv(root_dir / ".env", override=True)
 
 from shared.logger import get_logger
 from shared.models import MarketContext, MarketRegime, VolatilityLevel, MCPErrorResponse
@@ -446,17 +446,29 @@ async def get_full_market_context(symbol: str, timeframe: str = "1h") -> str:
             instruction = f"✅ 环境稳定维持在 {hmm_res}。请执行【路径 A：环境稳定期】仅做轻量级风控校验，快速响应，禁止长篇大论。"
             logger.info(f"环境稳定 ({hmm_res})，已下发轻量级风控指令。")
 
+        fvg_data = smc_res.get("fvg", {})
+        if fvg_data.get("has_fvg"):
+            fvg_insight = f"{fvg_data.get('type')} FVG ({fvg_data.get('gap_bottom')} - {fvg_data.get('gap_top')})"
+        else:
+            fvg_insight = "No FVG"
+
         # 5. 组装终极脱水研报 (Fat Payload)
+        # 【极致压缩】：仅保留结论性数据，剔除任何原始数组
         fat_payload = {
             "asset": symbol,
-            "current_price": ticker['last'],
+            "current_price": ticker.get('last', 0),
             "state_changed": is_state_changed,
             "market_regime": hmm_res,
             "previous_regime": previous_state,
-            "smart_money_concepts": smc_res,
+            "smart_money_concepts": {
+                "structure": smc_res.get("structure", {}).get("structure", "UNKNOWN"),
+                "key_support": smc_res.get("structure", {}).get("key_support"),
+                "key_resistance": smc_res.get("structure", {}).get("key_resistance"),
+                "fvg_insight": fvg_insight
+            } if isinstance(smc_res, dict) else smc_res,
             "orderflow": {
-                "static_ofi_score": ofi_score,
-                "dynamic_aggressor": aggressor_data # 注入真实的火拼数据
+                "ofi_score": ofi_score,
+                "aggressor_dominance": aggressor_data.get("dominance", "UNKNOWN")
             },
             "system_instruction": instruction
         }

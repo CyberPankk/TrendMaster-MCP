@@ -13,7 +13,7 @@ root_dir = Path(__file__).parent.parent.parent
 sys.path.append(str(root_dir))
 
 # 加载 .env 环境变量
-load_dotenv(root_dir / ".env")
+load_dotenv(root_dir / ".env", override=True)
 
 from shared.logger import get_logger
 from shared.models import MCPErrorResponse

@@ -95,19 +95,32 @@ class TrendMasterAgent:
         self.tool_routing_map: Dict[str, ClientSession] = {} 
         self.available_tools: List[Dict[str, Any]] = []
         self.memory_stream = AgentMemory() # 实例化记忆库
-        self.exit_stack = AsyncExitStack()
+        
+        # ⚠️ 彻底抛弃 AsyncExitStack，改为纯手工生命周期管理
+        # 这也是 mcp 官方文档中针对多客户端管理的推荐范式
+        self.sessions: List[ClientSession] = []
+        self.transports: List[Any] = []
         
         # 我们的 3 个微服务路径 (这里使用 python 命令启动)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
         self.mcp_servers = {
-            "Market": "servers/market_mcp/server.py",
-            "Indicator": "servers/indicator_mcp/server.py",
-            "Execution": "servers/execution_mcp/server.py"
+            "Market": os.path.join(base_dir, "servers/market_mcp/server.py"),
+            "Indicator": os.path.join(base_dir, "servers/indicator_mcp/server.py"),
+            "Execution": os.path.join(base_dir, "servers/execution_mcp/server.py"),
+            "Sentiment": os.path.join(base_dir, "servers/sentiment_mcp/server.py"),
+            "FactorLab": os.path.join(base_dir, "servers/factor_lab_mcp/server.py"),
+            "Strategy": os.path.join(base_dir, "servers/strategy_mcp/server.py")
         }
 
     def load_skill_sop(self) -> str:
         """加载 Agent 的核心交易纪律"""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.abspath(os.path.join(base_dir, "..", ".."))
         try:
-            with open("skills/Strategy-SOP.skill", "r", encoding="utf-8") as f:
+            local_path = os.path.join(base_dir, "skills", "Strategy-SOP.skill")
+            root_path = os.path.join(repo_root, "skills", "Strategy-SOP.skill")
+            path = local_path if os.path.exists(local_path) else root_path
+            with open(path, "r", encoding="utf-8") as f:
                 sop = f.read()
                 logger.info("✅ 成功加载 Strategy-SOP.skill")
                 return sop
@@ -115,8 +128,32 @@ class TrendMasterAgent:
             logger.error(f"无法读取 SOP 规则: {e}")
             return "You are a helpful trading assistant."
 
+    def load_skill(self, skill_name: str) -> str:
+        """
+        按策略名加载技能书（.skill），例如 Trend-Sniper -> skills/Trend-Sniper.skill
+        文件不存在时回退到基础安全提示词。
+        """
+        safe_fallback = (
+            "You are a cautious trading assistant. "
+            "If information is insufficient or risk is high, always output <ACTION>WAIT</ACTION>."
+        )
+        if not skill_name:
+            return safe_fallback
+        try:
+            filename = f"{skill_name}.skill"
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            repo_root = os.path.abspath(os.path.join(base_dir, "..", ".."))
+            local_path = os.path.join(base_dir, "skills", filename)
+            root_path = os.path.join(repo_root, "skills", filename)
+            path = local_path if os.path.exists(local_path) else root_path
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            logger.error(f"无法读取技能书 {skill_name}: {e}")
+            return safe_fallback
+
     async def init_mcp_connections(self):
-        """同时启动并连接多个 MCP Server，使用 AsyncExitStack 管理生命周期"""
+        """同时启动并连接多个 MCP Server，手动管理生命周期"""
         logger.info(f"{Fore.CYAN}正在唤醒 MCP 微服务集群...{Style.RESET_ALL}")
         
         for name, script_path in self.mcp_servers.items():
@@ -132,12 +169,17 @@ class TrendMasterAgent:
             )
             
             try:
-                # 1. 进入 stdio_client 上下文
-                stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-                read, write = stdio_transport
+                # 1. 启动并管理 stdio_client
+                # ⚠️ 修复：直接获取 stdio_client 的 context manager，并在其中包装 session
+                # 这样可以确保 anyio 的 task group 不会在多个 task 之间乱窜
+                stdio_cm = stdio_client(server_params)
+                read, write = await stdio_cm.__aenter__()
+                self.transports.append(stdio_cm) # 记录下来以便 cleanup 时 __aexit__
                 
-                # 2. 进入 ClientSession 上下文
-                session = await self.exit_stack.enter_async_context(ClientSession(read, write))
+                # 2. 启动并管理 ClientSession
+                session = ClientSession(read, write)
+                await session.__aenter__()
+                self.sessions.append(session)
                 
                 # 3. 初始化连接
                 await session.initialize()
@@ -156,6 +198,11 @@ class TrendMasterAgent:
                     }
                     self.available_tools.append(anthropic_tool)
                     logger.info(f"  🔧 注册 Tool: {Fore.YELLOW}{tool.name}{Style.RESET_ALL} -> [{name}-MCP]")
+                    
+                # 手动注入可能由于网络原因未在启动时声明，但服务端已包含的 Tool (容错机制)
+                if name == "Market" and "get_ticker" not in self.tool_routing_map:
+                    self.tool_routing_map["get_ticker"] = session
+                    logger.info(f"  🔧 手动补充注册 Tool: {Fore.YELLOW}get_ticker{Style.RESET_ALL} -> [{name}-MCP]")
                     
                 logger.info(f"{Fore.GREEN}✅ {name}-MCP 准备就绪{Style.RESET_ALL}")
                 
@@ -198,13 +245,17 @@ class TrendMasterAgent:
             await self.init_mcp_connections()
             
             system_prompt = self.load_skill_sop()
+            system_prompt += "\n\n" + self.load_skill("Trend-Sniper")
+            system_prompt += "\n\n" + self.load_skill("Mean-Reversion")
+            system_prompt += "\n\n" + self.load_skill("Portfolio-Risk")
             system_prompt += "\n\n【系统强制指令】\n在你开始任何交易分析前，必须首先阅读上方的 Strategy-SOP 规则。\n**分析行情时，只能调用 `get_full_market_context` 工具一次，不要尝试分开获取指标！**\n你必须在思考链 (Chain of Thought) 中明确展示你是如何将 HMM 状态与 SMC 信号进行对齐的。绝对禁止在没有任何数据支撑的情况下瞎猜点位。"
+            system_prompt += "\n\n【舆情强制指令】\n当且仅当你准备输出 BUY/SELL 时，必须先调用一次 `get_comprehensive_sentiment` 获取舆情与宏观日历；若存在 impact=CRITICAL 的宏观事件，必须输出 WAIT。"
             
             # OpenAI 格式需要将 system prompt 放入 messages 列表
             messages = []
             if self.llm_provider in ["deepseek", "ofox"]:
                 messages.append({"role": "system", "content": system_prompt})
-            
+                
             logger.info("\n" + "="*60)
             logger.info(f"{Fore.MAGENTA}🤖 TrendMaster 核心中枢已上线 (Powered by {self.llm_provider.upper()} & MCP){Style.RESET_ALL}")
             logger.info(f"{Fore.MAGENTA}🧠 记忆流模块已就绪 (agent_memory.json){Style.RESET_ALL}")
@@ -214,7 +265,7 @@ class TrendMasterAgent:
             anthropic_messages: List[MessageParam] = []
             
             while True:
-                user_input = input(f"\n{Fore.BLUE}🧑‍💻 长官，请下达指令 (输入 'exit' 退出): {Style.RESET_ALL}")
+                user_input = await asyncio.to_thread(input, f"\n{Fore.BLUE}🧑‍💻 长官，请下达指令 (输入 'exit' 退出): {Style.RESET_ALL}")
                 if user_input.lower() in ['exit', 'quit']:
                     self.memory_stream._save_db() # 退出前强制保存一次记忆
                     break
@@ -323,7 +374,43 @@ class TrendMasterAgent:
                         action_match = re.search(r'<ACTION>([A-Z]+)</ACTION>', final_reply_content, re.IGNORECASE)
                         action = action_match.group(1).upper() if action_match else None
                         
-                        if action in ["BUY", "SELL"]:
+                        if action == "EMERGENCY_LIQUIDATE":
+                            logger.error(f"{Fore.RED}🚨 捕获到核按钮指令 [EMERGENCY_LIQUIDATE]，立即触发强平！{Style.RESET_ALL}")
+                            try:
+                                res = await self.call_mcp_tool_directly(server_name="Execution", tool_name="kill_all_positions_global", arguments={})
+                                logger.info(f"{Fore.GREEN}✅ 强平调用结果: {res}{Style.RESET_ALL}")
+                            except Exception as e:
+                                logger.error(f"❌ 全局强平调用失败: {e}")
+                                try:
+                                    res = await self.call_mcp_tool_directly(
+                                        server_name="Execution",
+                                        tool_name="kill_all_positions",
+                                        arguments={"symbol": symbol_to_analyze},
+                                    )
+                                    logger.info(f"{Fore.GREEN}✅ 单品种强平调用结果: {res}{Style.RESET_ALL}")
+                                except Exception as e2:
+                                    logger.error(f"❌ 单品种强平调用失败: {e2}")
+                        elif action == "REBALANCE":
+                            weights_match = re.search(r"<WEIGHTS>(.*?)</WEIGHTS>", final_reply_content, re.IGNORECASE | re.DOTALL)
+                            if not weights_match:
+                                logger.error("❌ 未找到 <WEIGHTS>...</WEIGHTS>，按 HOLD 处理。")
+                            else:
+                                weights_text = weights_match.group(1).strip()
+                                try:
+                                    weights = json.loads(weights_text)
+                                    if not isinstance(weights, dict):
+                                        raise ValueError("WEIGHTS JSON must be an object/dict")
+                                    res = await self.call_mcp_tool_directly(
+                                        server_name="Strategy",
+                                        tool_name="rebalance_capital_allocation",
+                                        arguments={"strategy_weights": weights},
+                                    )
+                                    logger.info(f"{Fore.GREEN}✅ 调仓调用结果: {res}{Style.RESET_ALL}")
+                                except Exception as e:
+                                    logger.error(f"❌ WEIGHTS 解析或调仓失败: {e}。按 HOLD 处理。")
+                        elif action == "HOLD":
+                            logger.info(f"{Fore.BLUE}🧊 收到 HOLD 指令，维持现状。{Style.RESET_ALL}")
+                        elif action in ["BUY", "SELL"]:
                             logger.info(f"{Fore.YELLOW}⚔️ 捕获到交易指令 [{action}]，Python 客户端接管执行流程...{Style.RESET_ALL}")
                             # 固定下单 500 USDT (您可以根据需要通过正则进一步提取金额，这里按要求执行一笔固定数量交易，或默认 500)
                             # 从 user_input 提取金额
@@ -354,15 +441,34 @@ class TrendMasterAgent:
                             logger.warn(f"⚠️ 未能从模型输出中提取到标准的 <ACTION> 标签。")
 
                 except Exception as e:
-                    logger.error(f"大模型通信或处理失败: {e}")
-
+                    logger.error(f"推理请求失败: {e}")
         except Exception as e:
-            logger.error(f"Agent 初始化失败: {e}")
-        finally:
-            # 无论发生什么，优雅关闭所有 MCP 进程
-            logger.info("正在关闭所有 MCP 连接...")
-            await self.exit_stack.aclose()
-            logger.info("退出完成。")
+            logger.error(f"Agent 交互主循环发生异常: {e}")
+
+    async def cleanup(self):
+        """优雅清理资源"""
+        logger.info("🔌 正在关闭 MCP 集群连接 (Agent Client)...")
+        try:
+            # 清空路由表
+            self.tool_routing_map.clear()
+            
+            # 1. 逐个关闭 session (先停止收发消息)
+            for session in reversed(self.sessions):
+                try:
+                    # 避免使用 __aexit__，直接取消后台收发任务
+                    if hasattr(session, '_cancel_tasks'):
+                        session._cancel_tasks()
+                except Exception:
+                    pass
+            self.sessions.clear()
+            
+            # 2. 对于底层的 stdio 管道，不调用 __aexit__ 以免触发 anyio 的跨任务异常
+            # 直接通过系统垃圾回收来清理进程即可
+            self.transports.clear()
+            
+            logger.info("✅ MCP 集群连接已断开")
+        except Exception as e:
+            logger.warning(f"⚠️ 清理 MCP 集群时发生异常 (可忽略): {e}")
 
 if __name__ == "__main__":
     import sys

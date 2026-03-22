@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -11,7 +12,31 @@ sys.path.append(str(root_dir))
 load_dotenv(root_dir / ".env", override=True)
 
 import ccxt.async_support as ccxt
+
+# 禁用 ccxt 和 aiohttp 在退出时的烦人警告
+try:
+    from ccxt.async_support.base.exchange import Exchange
+    if hasattr(Exchange, '__del__'):
+        Exchange.__del__ = lambda self: None
+except Exception:
+    pass
+
+try:
+    from aiohttp.client import ClientSession
+    if hasattr(ClientSession, '__del__'):
+        ClientSession.__del__ = lambda self: None
+except Exception:
+    pass
+
+try:
+    from aiohttp.connector import BaseConnector
+    if hasattr(BaseConnector, '__del__'):
+        BaseConnector.__del__ = lambda self: None
+except Exception:
+    pass
+
 from mcp.server.fastmcp import FastMCP
+
 
 from shared.logger import get_logger
 from shared.models import TickerData, MCPErrorResponse, OrderbookSnapshot
@@ -57,7 +82,7 @@ def get_exchange_config():
         
     return config
 
-# @mcp.tool()
+@mcp.tool()
 async def get_ticker(symbol: str) -> str:
     """
     [Agent 工具] 获取指定交易对（如 BTC/USDT）的最新市场行情 (Ticker)。
@@ -95,29 +120,29 @@ async def get_ticker(symbol: str) -> str:
     except ccxt.NetworkError as e:
         error_msg = f"Network error when fetching {symbol}: {str(e)}"
         logger.error(error_msg)
-        return MCPErrorResponse(
-            status="error",
-            error_code="NETWORK_ERROR",
-            message=error_msg
-        ).model_dump_json()
+        return json.dumps({
+            "status": "error",
+            "error_code": "NETWORK_ERROR",
+            "message": error_msg
+        })
         
     except ccxt.ExchangeError as e:
         error_msg = f"Exchange error for {symbol}: {str(e)}"
         logger.error(error_msg)
-        return MCPErrorResponse(
-            status="error",
-            error_code="EXCHANGE_ERROR",
-            message=error_msg
-        ).model_dump_json()
+        return json.dumps({
+            "status": "error",
+            "error_code": "EXCHANGE_ERROR",
+            "message": error_msg
+        })
         
     except Exception as e:
-        error_msg = f"Unexpected error when fetching {symbol}: {str(e)}"
+        error_msg = f"Unexpected error for {symbol}: {str(e)}"
         logger.error(error_msg)
-        return MCPErrorResponse(
-            status="error",
-            error_code="INTERNAL_ERROR",
-            message=error_msg
-        ).model_dump_json()
+        return json.dumps({
+            "status": "error",
+            "error_code": "INTERNAL_ERROR",
+            "message": error_msg
+        })
         
     finally:
         # 确保释放和关闭异步连接，防止资源泄露

@@ -5,6 +5,29 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 import ccxt.async_support as ccxt
+
+# 禁用 ccxt 和 aiohttp 在退出时的烦人警告
+try:
+    from ccxt.async_support.base.exchange import Exchange
+    if hasattr(Exchange, '__del__'):
+        Exchange.__del__ = lambda self: None
+except Exception:
+    pass
+
+try:
+    from aiohttp.client import ClientSession
+    if hasattr(ClientSession, '__del__'):
+        ClientSession.__del__ = lambda self: None
+except Exception:
+    pass
+
+try:
+    from aiohttp.connector import BaseConnector
+    if hasattr(BaseConnector, '__del__'):
+        BaseConnector.__del__ = lambda self: None
+except Exception:
+    pass
+
 from mcp.server.fastmcp import FastMCP
 import time
 
@@ -359,6 +382,66 @@ async def kill_all_positions(symbol: str) -> str:
     except Exception as e:
         logger.error(f"熔断失败: {str(e)}")
         return MCPErrorResponse(status="error", error_code="KILL_SWITCH_FAILED", message=str(e)).model_dump_json()
+
+@mcp.tool()
+async def kill_all_positions_global() -> str:
+    try:
+        await engine.init_exchange()
+        logger.warn("🚨 收到全局清仓指令: GLOBAL")
+
+        symbols = set()
+        try:
+            positions = await engine.ex.fetch_positions()
+            for position in positions or []:
+                try:
+                    contracts = float(position.get("contracts") or 0)
+                except Exception:
+                    contracts = 0.0
+                if contracts > 0:
+                    sym = position.get("symbol")
+                    if sym:
+                        symbols.add(sym)
+        except Exception as e:
+            logger.error(f"获取全局持仓失败: {e}")
+
+        try:
+            open_orders = await engine.ex.fetch_open_orders()
+            for o in open_orders or []:
+                sym = o.get("symbol")
+                if sym:
+                    symbols.add(sym)
+        except Exception as e:
+            logger.error(f"获取全局挂单失败: {e}")
+
+        cancelled = 0
+        closed = 0
+        errors = []
+
+        for sym in sorted(symbols):
+            try:
+                await engine.cancel_all_orders(sym)
+                cancelled += 1
+            except Exception as e:
+                errors.append({"symbol": sym, "stage": "cancel_all_orders", "error": str(e)})
+            try:
+                c = await engine.close_all_positions(sym)
+                closed += int(c or 0)
+            except Exception as e:
+                errors.append({"symbol": sym, "stage": "close_all_positions", "error": str(e)})
+
+        return str(
+            {
+                "status": "success",
+                "message": "Global kill switch executed.",
+                "symbols_affected": sorted(symbols),
+                "orders_cancelled_symbols": cancelled,
+                "positions_closed_count": closed,
+                "errors": errors,
+            }
+        )
+    except Exception as e:
+        logger.error(f"全局熔断失败: {str(e)}")
+        return MCPErrorResponse(status="error", error_code="KILL_SWITCH_GLOBAL_FAILED", message=str(e)).model_dump_json()
 
 if __name__ == "__main__":
     mcp.run()

@@ -10,15 +10,17 @@ logger = get_logger("HMM-Engine")
 class HMMEngine:
     def __init__(self, n_components=3):
         self.n_components = n_components
+        self.scaler = StandardScaler()
+
+    def _create_model(self):
         # 优化点 1: 大幅增加迭代次数，放宽收敛容差
-        self.model = GaussianHMM(
-            n_components=n_components, 
+        return GaussianHMM(
+            n_components=self.n_components, 
             covariance_type="full", 
             n_iter=2000,     # 原来可能是默认的 10 或 100
             tol=1e-3,        # 容差阈值
             random_state=42
         )
-        self.scaler = StandardScaler()
 
     def prepare_features(self, df: pd.DataFrame):
         """提取特征并进行标准化"""
@@ -41,20 +43,23 @@ class HMMEngine:
         try:
             features = self.prepare_features(df)
             
+            # 每次重新创建模型，避免 hmmlearn 在多次 fit 时产生属性被覆盖的 logging.warning 警告
+            model = self._create_model()
+            
             # 捕获并忽略底层的冗余警告，保持日志清爽
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                self.model.fit(features)
+                model.fit(features)
                 
-            if not self.model.monitor_.converged:
-                logger.warn(f"HMM 在 {self.model.monitor_.iter} 次迭代后达到阈值，已取当前最优解。")
+            if not model.monitor_.converged:
+                logger.warn(f"HMM 在 {model.monitor_.iter} 次迭代后达到阈值，已取当前最优解。")
                 
-            states = self.model.predict(features)
+            states = model.predict(features)
             current_state_id = int(states[-1])
             
             # 优化点 3: 状态重排 (State Sorting by Volatility)
             # 获取每个状态的协方差矩阵中 'range' 特征（索引1）的方差
-            variances = np.array([cov[1, 1] for cov in self.model.covars_])
+            variances = np.array([cov[1, 1] for cov in model.covars_])
             # 将方差从小到大排序的索引
             sorted_idx = np.argsort(variances)
             

@@ -5,7 +5,31 @@ from dotenv import load_dotenv
 import time
 import pandas as pd
 import ccxt.async_support as ccxt
+
+# 禁用 ccxt 和 aiohttp 在退出时的烦人警告
+try:
+    from ccxt.async_support.base.exchange import Exchange
+    if hasattr(Exchange, '__del__'):
+        Exchange.__del__ = lambda self: None
+except Exception:
+    pass
+
+try:
+    from aiohttp.client import ClientSession
+    if hasattr(ClientSession, '__del__'):
+        ClientSession.__del__ = lambda self: None
+except Exception:
+    pass
+
+try:
+    from aiohttp.connector import BaseConnector
+    if hasattr(BaseConnector, '__del__'):
+        BaseConnector.__del__ = lambda self: None
+except Exception:
+    pass
+
 from mcp.server.fastmcp import FastMCP
+
 
 # 添加项目根目录到 sys.path
 root_dir = Path(__file__).parent.parent.parent
@@ -20,6 +44,7 @@ from servers.indicator_mcp.engines.smc_engine import SMCEngine
 from servers.indicator_mcp.engines.hmm_engine import HMMEngine
 from servers.indicator_mcp.engines.orderflow_engine import OrderflowEngine
 from servers.indicator_mcp.engines.ws_engine import WsMemoryPool  # 引入新引擎
+from servers.indicator_mcp.dynamic_loader import load_dynamic_alpha_tools # 引入动态因子加载器
 import numpy as np
 import asyncio
 import json
@@ -30,6 +55,12 @@ from asyncache import cached
 # 初始化
 logger = get_logger("Indicator-Server")
 mcp = FastMCP("Indicator-Server")
+
+# ==========================================
+# 🔌 动态装载 CogAlpha 挖掘的专属因子
+# ==========================================
+ACTIVE_ALPHAS_DIR = os.path.abspath(os.path.join(root_dir, "../../data/active_alphas"))
+load_dynamic_alpha_tools(mcp, ACTIVE_ALPHAS_DIR)
 
 # 实例化全局内存池
 ws_pool = WsMemoryPool()

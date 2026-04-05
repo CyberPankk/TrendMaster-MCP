@@ -48,7 +48,7 @@ from asyncache import cached
 load_dotenv()
 
 logger = get_logger("Execution-Server")
-mcp = FastMCP("Execution-Server")
+mcp = FastMCP("Execution-Server", port=8000)
 
 # --- 动态加载风控阈值与安全开关 ---
 RISK_CONFIG = {
@@ -77,34 +77,46 @@ class ExecutionEngine:
             logger.error("API Key or Secret not found in environment variables!")
             # 可以在这里抛出异常或在 init_exchange 时处理
 
+    def _do_init_sync(self):
+        """后台线程中执行沉重的初始化 (同步)"""
+        import ccxt
+        if not self.api_key or not self.secret:
+             raise ValueError("Missing API credentials")
+             
+        exchange_config = {
+            'apiKey': self.api_key,
+            'secret': self.secret,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'swap'} # 默认合约交易
+        }
+        
+        # 动态加载代理
+        proxy_url = os.getenv("CCXT_PROXY")
+        if proxy_url:
+            exchange_config['proxies'] = {
+                'http': proxy_url,
+                'https': proxy_url
+            }
+             
+        # 实例化 ccxt 异步引擎 (虽然是异步类，但实例化过程包含复杂的正则预编译和配置加载)
+        ex = getattr(ccxt.async_support, self.exchange_id)(exchange_config)
+        
+        # 如果是 Testnet，开启沙盒模式
+        if os.getenv("USE_TESTNET", "False").lower() in ("true", "1", "yes"):
+            ex.set_sandbox_mode(True)
+            
+        return ex
+
     async def init_exchange(self):
         if not self.ex:
-            if not self.api_key or not self.secret:
-                 raise ValueError("Missing API credentials")
-                 
-            exchange_config = {
-                'apiKey': self.api_key,
-                'secret': self.secret,
-                'enableRateLimit': True,
-                'options': {'defaultType': 'swap'} # 默认合约交易
-            }
+            logger.info("⏳ [Hummingbot] 正在后台线程执行沉重的引擎初始化...")
+            # 强行将 Hummingbot(CCXT) 的启动逻辑剥离到后台线程运行，彻底解放主事件循环
+            self.ex = await asyncio.to_thread(self._do_init_sync)
             
-            # 动态加载代理
-            proxy_url = os.getenv("CCXT_PROXY")
-            if proxy_url:
-                exchange_config['proxies'] = {
-                    'http': proxy_url,
-                    'https': proxy_url
-                }
-                 
-            self.ex = getattr(ccxt, self.exchange_id)(exchange_config)
-            
-            # 如果是 Testnet，开启沙盒模式
-            if os.getenv("USE_TESTNET", "False").lower() in ("true", "1", "yes"):
-                self.ex.set_sandbox_mode(True)
-                
-            # 加载市场数据以确保精度计算正确
-            await self.ex.load_markets()
+            # 异步加载市场数据
+            logger.info("⏳ [Hummingbot] 正在后台任务中加载市场数据 (load_markets)...")
+            await asyncio.create_task(self.ex.load_markets())
+            logger.info("✅ MCP 服务器已启动，事件循环无阻塞，正在后台加载 Hummingbot...")
 
     async def validate_risk(self, symbol: str, amount_usd: float, order_type: str = 'market', volatility: float = 0.0):
         """
@@ -444,4 +456,4 @@ async def kill_all_positions_global() -> str:
         return MCPErrorResponse(status="error", error_code="KILL_SWITCH_GLOBAL_FAILED", message=str(e)).model_dump_json()
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="sse")

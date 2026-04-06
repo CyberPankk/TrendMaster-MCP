@@ -15,7 +15,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # 引入我们已经打磨完美的 Agent 核心组件
 from agent_client import TrendMasterAgent 
 from shared.telegram_notifier import send_tg_alert
-from shared.db_manager import init_db, insert_trade_log
+from shared.db_manager import init_db, insert_trade_log, get_today_summary
+from datetime import datetime
 
 logger = get_logger("API-Gateway")
 
@@ -32,6 +33,27 @@ async def auto_cruise_job():
     except Exception as e:
         logger.error(f"❌ [Auto-Cruise] 巡航任务异常崩溃: {e}")
 
+async def daily_report_job():
+    """每日量化财报推送任务"""
+    logger.info("📊 正在生成并推送今日量化财报...")
+    try:
+        summary = await get_today_summary()
+        
+        # 组装精美的 Markdown 报告
+        report_msg = (
+            f"📊 *TrendMaster 每日量化财报*\n\n"
+            f"📅 日期：`{datetime.now().strftime('%Y-%m-%d')}`\n"
+            f"⚡️ 总交易笔数：`{summary['total_trades']}` 笔\n"
+            f"🟢 做多次数 (BUY)：`{summary['buys']}` 笔\n"
+            f"🔴 做空次数 (SELL)：`{summary['sells']}` 笔\n"
+            f"💰 日内总交易额：`${summary['total_amount_usd']:.2f}`\n\n"
+            f"✨ _自动巡航引擎将持续为您守护资产。_"
+        )
+        
+        await send_tg_alert(report_msg)
+    except Exception as e:
+        logger.error(f"❌ [Daily-Report] 财报生成任务异常: {e}")
+
 # 启动时初始化 MCP 连接
 @app.on_event("startup")
 async def startup_event():
@@ -43,10 +65,11 @@ async def startup_event():
     
     # 挂载定时任务
     scheduler.add_job(auto_cruise_job, 'interval', minutes=15)
+    scheduler.add_job(daily_report_job, 'cron', hour=23, minute=50)
     scheduler.start()
     
     # 发送 Telegram 通知
-    await send_tg_alert("🚀 *TrendMaster Quant 4.0* 已上线，API 网关启动成功！\n⚙️ 自动巡航引擎已启动，周期：15分钟")
+    await send_tg_alert("🚀 *TrendMaster Quant 4.0* 已上线，API 网关启动成功！\n⚙️ 自动巡航引擎已启动，周期：15分钟\n📊 财报调度器已激活，将在每天 23:50 推送今日战报。")
 
 @app.on_event("shutdown")
 async def shutdown_event():

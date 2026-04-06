@@ -1,3 +1,9 @@
+import sys
+import os
+
+# 将主项目根目录加入到 sys.path 中，以便能读取到 shared/telegram_notifier.py
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+
 import asyncio
 import re
 from fastapi import FastAPI, HTTPException
@@ -9,6 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # 引入我们已经打磨完美的 Agent 核心组件
 from agent_client import TrendMasterAgent 
 from shared.telegram_notifier import send_tg_alert
+from shared.db_manager import init_db, insert_trade_log
 
 logger = get_logger("API-Gateway")
 
@@ -30,6 +37,9 @@ async def auto_cruise_job():
 async def startup_event():
     logger.info("🚀 正在启动 API 网关并连接 MCP 底层服务...")
     await agent.init_mcp_connections()
+    
+    # 初始化 SQLite 账本
+    init_db()
     
     # 挂载定时任务
     scheduler.add_job(auto_cruise_job, 'interval', minutes=15)
@@ -194,6 +204,9 @@ async def analyze_and_trade(req: TradeRequest):
                 )
                 asyncio.create_task(send_tg_alert(report_msg))
                 
+                # 记录交易账本
+                await insert_trade_log(req.symbol, action, dynamic_amount, reply, exec_status)
+                
         elif action == "WAIT":
              logger.info(f"⏳ 收到观望指令，跳过执行。")
             
@@ -209,4 +222,4 @@ async def analyze_and_trade(req: TradeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run("api_server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api_server:app", host="0.0.0.0", port=8002, reload=True)

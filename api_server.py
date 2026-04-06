@@ -4,24 +4,44 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 from shared.logger import get_logger
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # 引入我们已经打磨完美的 Agent 核心组件
 from agent_client import TrendMasterAgent 
+from shared.telegram_notifier import send_tg_alert
 
 logger = get_logger("API-Gateway")
 
 app = FastAPI(title="TrendMaster Quant 4.0 API", version="1.0")
 agent = TrendMasterAgent()
+scheduler = AsyncIOScheduler()
+
+async def auto_cruise_job():
+    """后台自动巡航任务"""
+    logger.info("⚙️ [Auto-Cruise] 触发定时巡航...")
+    try:
+        req = TradeRequest(symbol="BTC/USDT", timeframe="1h")
+        await analyze_and_trade(req)
+    except Exception as e:
+        logger.error(f"❌ [Auto-Cruise] 巡航任务异常崩溃: {e}")
 
 # 启动时初始化 MCP 连接
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 正在启动 API 网关并连接 MCP 底层服务...")
     await agent.init_mcp_connections()
+    
+    # 挂载定时任务
+    scheduler.add_job(auto_cruise_job, 'interval', minutes=15)
+    scheduler.start()
+    
+    # 发送 Telegram 通知
+    await send_tg_alert("🚀 *TrendMaster Quant 4.0* 已上线，API 网关启动成功！\n⚙️ 自动巡航引擎已启动，周期：15分钟")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("🛑 正在关闭 API 网关及 MCP 连接...")
+    scheduler.shutdown()
     await agent.exit_stack.aclose()
 
 class TradeRequest(BaseModel):
@@ -103,13 +123,77 @@ async def analyze_and_trade(req: TradeRequest):
         # 5. 拦截执行逻辑
         exec_status = "Skipped (Action was WAIT)"
         if action in ["BUY", "SELL"]:
-            logger.info(f"⚔️ 触发执行层: {action} {req.symbol} ${req.amount_usd}")
-            exec_res = await agent.call_mcp_tool_directly(
-                "Execution-MCP", 
-                "execute_smart_order", 
-                {"symbol": req.symbol, "side": action.lower(), "amount_usd": req.amount_usd}
-            )
-            exec_status = str(exec_res)
+            logger.info(f"💰 正在计算动态可用资金头寸...")
+            try:
+                # 获取真实余额
+                balance_res = await agent.call_mcp_tool_directly("Execution-MCP", "get_account_balance", {})
+                
+                # 安全解析 USDT 余额
+                usdt_balance = 0.0
+                if isinstance(balance_res, dict):
+                    if "data" in balance_res:
+                        import ast
+                        try:
+                            balance_data = ast.literal_eval(balance_res["data"])
+                            usdt_balance = float(balance_data.get("total", {}).get("USDT", 0.0))
+                        except Exception:
+                            usdt_balance = float(balance_res.get("data", 0.0))
+                    else:
+                        usdt_balance = float(balance_res.get("total", {}).get("USDT", 0.0))
+                else:
+                    import ast
+                    try:
+                        balance_data = ast.literal_eval(balance_res)
+                        usdt_balance = float(balance_data.get("total", {}).get("USDT", 0.0))
+                    except Exception:
+                        usdt_balance = float(balance_res)
+                        
+                logger.info(f"💵 当前账户 USDT 余额: {usdt_balance:.2f}")
+            except Exception as e:
+                logger.error(f"❌ 动态头寸计算失败，回退至默认资金。原因: {e}")
+                usdt_balance = 1000.0
+
+            # 严格按照配置分配 5% 仓位
+            POSITION_RISK_PCT = 0.05
+            dynamic_amount = usdt_balance * POSITION_RISK_PCT
+            
+            if dynamic_amount < 10.0:
+                logger.warning(f"⚠️ 计算出的头寸 {dynamic_amount:.2f} USDT 低于最小下单金额，跳过本次发单！")
+                exec_status = "Skipped (Amount too low)"
+            else:
+                logger.info(f"⚔️ 触发执行层: {action} {req.symbol} ${dynamic_amount:.2f} (5% of Balance)")
+                exec_res = await agent.call_mcp_tool_directly(
+                    "Execution-MCP", 
+                    "execute_smart_order", 
+                    {"symbol": req.symbol, "side": action.lower(), "amount_usd": dynamic_amount}
+                )
+                exec_status = str(exec_res)
+                
+                # 推送 Telegram 战报
+                action_emoji = "🟢" if action == "BUY" else "🔴"
+                
+                # 尝试从执行结果提取均价
+                avg_price = "N/A"
+                if isinstance(exec_res, dict) and "data" in exec_res:
+                    import ast
+                    try:
+                        exec_data = ast.literal_eval(exec_res["data"])
+                        avg_price = f"${exec_data.get('average', 'N/A')}"
+                    except Exception:
+                        pass
+
+                report_msg = (
+                    f"🚀 *TrendMaster Quant 执行战报*\n\n"
+                    f"交易对：`{req.symbol}`\n"
+                    f"动作：{action_emoji} *{action}*\n"
+                    f"开仓金额：`${dynamic_amount:.2f}`\n"
+                    f"成交均价：{avg_price}\n"
+                    f"当前余额：`${usdt_balance:.2f}`\n\n"
+                    f"🧠 *AI 决策核心逻辑*：\n"
+                    f"_{reply[:500]}..._"
+                )
+                asyncio.create_task(send_tg_alert(report_msg))
+                
         elif action == "WAIT":
              logger.info(f"⏳ 收到观望指令，跳过执行。")
             

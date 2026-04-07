@@ -17,12 +17,54 @@ from agent_client import TrendMasterAgent
 from shared.telegram_notifier import send_tg_alert
 from shared.db_manager import init_db, insert_trade_log, get_today_summary
 from datetime import datetime
+from skills_pool.shadow.shadow_manager import ShadowPoolManager
 
 logger = get_logger("API-Gateway")
 
 app = FastAPI(title="TrendMaster Quant 4.0 API", version="1.0")
 agent = TrendMasterAgent()
 scheduler = AsyncIOScheduler()
+shadow_manager = ShadowPoolManager()
+
+async def run_shadow_pool_job():
+    """沙盒策略池自动巡航任务"""
+    logger.info("👻 [Shadow-Pool] 触发定时沙盒巡航...")
+    try:
+        # 1. 尝试动态加载最新策略（支持热更新）
+        shadow_manager.load_skills()
+        
+        # 2. 获取行情数据，这里复用已有的工具逻辑
+        # 假设沙盒默认分析 BTC/USDT 的 1h K线数据
+        symbol = "BTC/USDT"
+        timeframe = "1h"
+        
+        # 调用 Indicator-MCP 获取 K线数据（复用已有能力）
+        logger.info(f"👻 [Shadow-Pool] 正在获取 {symbol} 行情数据供沙盒分析...")
+        klines_data = await agent.call_mcp_tool_directly(
+            "Indicator-MCP", 
+            "get_full_market_context", 
+            {"symbol": symbol, "timeframe": timeframe}
+        )
+        
+        # 尝试获取当前最新价格，如果无法获取，可以用一个占位符，或者尝试解析 klines_data
+        # 这里我们调用 Market-MCP 或直接在数据中获取
+        current_price = 0.0
+        try:
+            ticker_res = await agent.call_mcp_tool_directly("Market-MCP", "get_ticker", {"symbol": symbol})
+            if isinstance(ticker_res, dict) and "data" in ticker_res:
+                import ast
+                ticker_data = ast.literal_eval(ticker_res["data"])
+                current_price = float(ticker_data.get("last", 0.0))
+            elif isinstance(ticker_res, dict):
+                current_price = float(ticker_res.get("last", 0.0))
+        except Exception as e:
+            logger.warning(f"⚠️ [Shadow-Pool] 获取最新价格失败，将使用默认价格 0.0: {e}")
+            
+        # 3. 驱动沙盒管理器执行虚拟交易
+        await shadow_manager.execute_virtual_trading(klines_data, current_price)
+        
+    except Exception as e:
+        logger.error(f"❌ [Shadow-Pool] 沙盒巡航任务异常崩溃: {e}")
 
 async def auto_cruise_job():
     """后台自动巡航任务"""
@@ -65,11 +107,12 @@ async def startup_event():
     
     # 挂载定时任务
     scheduler.add_job(auto_cruise_job, 'interval', minutes=15)
+    scheduler.add_job(run_shadow_pool_job, 'interval', minutes=15)
     scheduler.add_job(daily_report_job, 'cron', hour=23, minute=50)
     scheduler.start()
     
     # 发送 Telegram 通知
-    await send_tg_alert("🚀 *TrendMaster Quant 4.0* 已上线，API 网关启动成功！\n⚙️ 自动巡航引擎已启动，周期：15分钟\n📊 财报调度器已激活，将在每天 23:50 推送今日战报。")
+    await send_tg_alert("🚀 *TrendMaster Quant 4.0* 已上线，API 网关启动成功！\n⚙️ 自动巡航引擎已启动，周期：15分钟\n👻 沙盒策略引擎已启动，周期：15分钟\n📊 财报调度器已激活，将在每天 23:50 推送今日战报。")
 
 @app.on_event("shutdown")
 async def shutdown_event():

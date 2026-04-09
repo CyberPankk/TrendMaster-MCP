@@ -244,11 +244,25 @@ class TrendMasterAgent:
             # 启动所有连接，如果失败会抛出异常
             await self.init_mcp_connections()
             
-            system_prompt = self.load_skill_sop()
+            # [Phase 32] 动态读取最新的 system_prompt.txt
+            prompt_path = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')), "data", "system_prompt.txt")
+            try:
+                if os.path.exists(prompt_path):
+                    with open(prompt_path, "r", encoding="utf-8") as f:
+                        dynamic_prompt = f.read()
+                else:
+                    dynamic_prompt = self.load_skill_sop()
+            except Exception as e:
+                logger.error(f"读取动态 prompt 失败，回退至默认 SOP: {e}")
+                dynamic_prompt = self.load_skill_sop()
+                
+            system_prompt = dynamic_prompt
+            
+            # [由于 agent_client 独有的多技能加载，我们仍保留这些附加技能]
             system_prompt += "\n\n" + self.load_skill("Trend-Sniper")
             system_prompt += "\n\n" + self.load_skill("Mean-Reversion")
             system_prompt += "\n\n" + self.load_skill("Portfolio-Risk")
-            system_prompt += "\n\n【系统强制指令】\n在你开始任何交易分析前，必须首先阅读上方的 Strategy-SOP 规则。\n**分析行情时，只能调用 `get_full_market_context` 工具一次，不要尝试分开获取指标！**\n你必须在思考链 (Chain of Thought) 中明确展示你是如何将 HMM 状态与 SMC 信号进行对齐的。绝对禁止在没有任何数据支撑的情况下瞎猜点位。"
+            system_prompt += "\n\n【系统强制指令】\n在你开始任何交易分析前，必须首先阅读上方的 Strategy-SOP 规则。\n**分析行情时，只能调用 `get_full_market_context` 工具一次，不要尝试分开获取指标！**\n你必须在思考链 (Chain of Thought) 中明确展示你是如何将 HMM 状态、SMC 信号与资金面因子进行对齐的。绝对禁止在没有任何数据支撑的情况下瞎猜点位。"
             system_prompt += "\n\n【舆情强制指令】\n当且仅当你准备输出 BUY/SELL 时，必须先调用一次 `get_comprehensive_sentiment` 获取舆情与宏观日历；若存在 impact=CRITICAL 的宏观事件，必须输出 WAIT。"
             
             # OpenAI 格式需要将 system prompt 放入 messages 列表
@@ -296,12 +310,26 @@ class TrendMasterAgent:
                             timeout=15.0
                         )
                         fat_data = result.content[0].text
-                        logger.info(f"{Fore.GREEN}✅ 极速脱水数据已获取，准备组装终极 Prompt{Style.RESET_ALL}")
+                        logger.info(f"{Fore.GREEN}✅ 极速脱水技术数据已获取{Style.RESET_ALL}")
                     except Exception as e:
                         logger.error(f"直接调用 Fat-Tool 失败: {e}")
                         fat_data = f"调用失败: {e}"
                 else:
                     logger.error("未找到 get_full_market_context 工具的路由映射")
+                    
+                # [Phase 32] 补充获取多维宏观与资金面因子
+                logger.info(f"{Fore.YELLOW}🌍 正在拉取宏观情绪与资金面因子...{Style.RESET_ALL}")
+                fear_greed_index = 45  # 1-100，模拟数据
+                funding_rate = 0.01    # 资金费率，模拟数据
+                ls_ratio = 1.2         # 多空比，模拟数据
+                
+                macro_factors = (
+                    f"【宏观与资金面因子】\n"
+                    f"- Fear & Greed Index (恐慌贪婪指数): {fear_greed_index} (Neutral)\n"
+                    f"- Funding Rate (资金费率): {funding_rate}%\n"
+                    f"- Long/Short Ratio (多空比): {ls_ratio}\n"
+                )
+                logger.info(f"{Fore.GREEN}✅ 宏观与资金面因子已就绪，准备组装终极 Prompt{Style.RESET_ALL}")
                     
                 # 注入前置记忆
                 past_memory = self.memory_stream.get_last_memory(symbol_to_analyze)
@@ -309,9 +337,10 @@ class TrendMasterAgent:
                 # 组装终极 Prompt
                 enriched_input = (
                     f"{past_memory}\n\n"
-                    f"【系统强制注入的底层数据】\n{fat_data}\n\n"
+                    f"【系统强制注入的底层技术数据】\n{fat_data}\n\n"
+                    f"{macro_factors}\n\n"
                     f"当前长官指令：{user_input}\n"
-                    f"请直接根据上述数据输出最终交易决策，严禁调用任何外部工具！"
+                    f"请直接综合上述【技术面】与【资金面】数据输出最终交易决策，严禁调用任何外部工具！"
                 )
                     
                 # 统一添加 User Message

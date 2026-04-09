@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 
 # 将主项目根目录加入到 sys.path 中，以便能读取到 shared/telegram_notifier.py
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
@@ -25,6 +26,62 @@ app = FastAPI(title="TrendMaster Quant 4.0 API", version="1.0")
 agent = TrendMasterAgent()
 scheduler = AsyncIOScheduler()
 shadow_manager = ShadowPoolManager()
+
+START_TIME = time.time()
+
+@app.get("/api/v1/health")
+async def health_check():
+    uptime_seconds = int(time.time() - START_TIME)
+    hours, remainder = divmod(uptime_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    
+    # scheduler.state == 1 means RUNNING, 2 means PAUSED
+    scheduler_state = "running" if scheduler.state == 1 else "paused" if scheduler.state == 2 else "stopped"
+    
+    return {
+        "status": "success",
+        "data": {
+            "uptime": uptime_str,
+            "scheduler_state": scheduler_state,
+            "mcp_status": "connected"
+        }
+    }
+
+@app.post("/api/v1/system/kill")
+async def system_kill():
+    logger.warning("🚨 [KILL SWITCH] 收到全局熔断指令！")
+    try:
+        # 第一步：暂停调度器
+        scheduler.pause()
+        logger.info("✅ 调度器已暂停，停止自动巡航。")
+        
+        # 第二步：调用底层 MCP，强制撤单平仓
+        await agent.call_mcp_tool_directly("Execution-MCP", "kill_all_positions_global", {})
+        logger.info("✅ 底层 MCP 强制撤单平仓指令已发送。")
+        
+        # 第三步：发送 TG 报警
+        await send_tg_alert("🚨 警告！触发全局熔断机制 (KILL SWITCH)！已强制撤单平仓并停止自动巡航！")
+        
+        return {"status": "success", "message": "Global Kill Switch Activated"}
+    except Exception as e:
+        logger.error(f"❌ [KILL SWITCH] 执行熔断失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/system/resume")
+async def system_resume():
+    logger.info("✅ [RESUME] 收到系统恢复指令！")
+    try:
+        scheduler.resume()
+        logger.info("✅ 调度器已恢复，重新开始自动巡航。")
+        
+        await send_tg_alert("✅ 系统已解除熔断，自动巡航恢复。")
+        
+        return {"status": "success", "message": "System Resumed"}
+    except Exception as e:
+        logger.error(f"❌ [RESUME] 系统恢复失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 async def run_shadow_pool_job():
     """沙盒策略池自动巡航任务"""

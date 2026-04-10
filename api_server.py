@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import json
 
 # 将主项目根目录加入到 sys.path 中，以便能读取到 shared/telegram_notifier.py
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
@@ -8,6 +9,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'
 import asyncio
 import re
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 import uvicorn
 from shared.logger import get_logger
@@ -16,16 +19,28 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # 引入我们已经打磨完美的 Agent 核心组件
 from agent_client import TrendMasterAgent 
 from shared.telegram_notifier import send_tg_alert
-from shared.db_manager import init_db, insert_trade_log, get_today_summary
+from shared.db_manager import init_db, insert_trade_log, get_today_summary, get_recent_shadow_trades, get_system_metrics
 from datetime import datetime
 from skills_pool.shadow.shadow_manager import ShadowPoolManager
+from skills_pool.lifecycle_manager import StrategyLifecycleManager
 
 logger = get_logger("API-Gateway")
 
 app = FastAPI(title="TrendMaster Quant 4.0 API", version="1.0")
+
+# 配置 CORS 允许前端跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 agent = TrendMasterAgent()
 scheduler = AsyncIOScheduler()
 shadow_manager = ShadowPoolManager()
+lifecycle_manager = StrategyLifecycleManager()
 
 START_TIME = time.time()
 
@@ -153,6 +168,14 @@ async def daily_report_job():
     except Exception as e:
         logger.error(f"❌ [Daily-Report] 财报生成任务异常: {e}")
 
+async def run_lifecycle_evaluation_job():
+    """每日沙盒策略考核结算任务"""
+    logger.info("⚔️ [Lifecycle] 触发每日角斗场考核任务...")
+    try:
+        await lifecycle_manager.evaluate_shadow_skills()
+    except Exception as e:
+        logger.error(f"❌ [Lifecycle] 角斗场考核任务异常: {e}")
+
 # 启动时初始化 MCP 连接
 @app.on_event("startup")
 async def startup_event():
@@ -165,17 +188,18 @@ async def startup_event():
     # 挂载定时任务
     scheduler.add_job(auto_cruise_job, 'interval', minutes=15)
     scheduler.add_job(run_shadow_pool_job, 'interval', minutes=15)
+    scheduler.add_job(run_lifecycle_evaluation_job, 'cron', hour=0, minute=0)
     scheduler.add_job(daily_report_job, 'cron', hour=23, minute=50)
     scheduler.start()
     
     # 发送 Telegram 通知
-    await send_tg_alert("🚀 *TrendMaster Quant 4.0* 已上线，API 网关启动成功！\n⚙️ 自动巡航引擎已启动，周期：15分钟\n👻 沙盒策略引擎已启动，周期：15分钟\n📊 财报调度器已激活，将在每天 23:50 推送今日战报。")
+    await send_tg_alert("🚀 *TrendMaster Quant 4.0* 已上线，API 网关启动成功！\n⚙️ 自动巡航引擎已启动，周期：15分钟\n👻 沙盒策略引擎已启动，周期：15分钟\n⚔️ 角斗场考核已部署，将在每天 00:00 进行策略结算。\n📊 财报调度器已激活，将在每天 23:50 推送今日战报。")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("🛑 正在关闭 API 网关及 MCP 连接...")
     scheduler.shutdown()
-    await agent.exit_stack.aclose()
+    await agent.cleanup()
 
 class TradeRequest(BaseModel):
     symbol: str = "BTC/USDT"
@@ -188,6 +212,63 @@ class TradeResponse(BaseModel):
     action: str
     reasoning: str
     execution_status: str
+
+
+class PromptUpdateRequest(BaseModel):
+    prompt: str | None = None
+    content: str | None = None
+
+    def get_prompt_text(self) -> str:
+        """兼容 prompt/content 两种字段名，统一提取热更新内容。"""
+        prompt_text = self.prompt if self.prompt is not None else self.content
+        if prompt_text is None:
+            raise ValueError("请求体缺少 prompt 字段")
+        return prompt_text
+
+
+@app.get("/api/v1/strategy/prompt", response_class=PlainTextResponse)
+async def get_strategy_prompt():
+    """读取 system_prompt.txt 最新内容，供前端与后端统一查看当前 Prompt。"""
+    prompt_content = agent.read_latest_system_prompt()
+    return prompt_content
+
+
+@app.post("/api/v1/strategy/prompt")
+async def update_strategy_prompt(req: PromptUpdateRequest):
+    """热更新 system_prompt.txt，后续 API 调用与 CLI 会自动读取最新内容。"""
+    try:
+        prompt_path = agent.write_system_prompt(req.get_prompt_text())
+        return {
+            "status": "success",
+            "message": "system_prompt.txt updated successfully",
+            "data": {
+                "path": prompt_path,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"❌ 热更新 system_prompt.txt 失败: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+@app.get("/api/v1/shadow/trades")
+async def api_get_shadow_trades(limit: int = 50):
+    try:
+        trades = await get_recent_shadow_trades(limit)
+        return {"success": True, "data": trades}
+    except Exception as e:
+        logger.error(f"获取影子账本失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/shadow/metrics")
+async def api_get_shadow_metrics():
+    try:
+        metrics = await get_system_metrics()
+        return {"success": True, "data": metrics}
+    except Exception as e:
+        logger.error(f"获取系统指标失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/analyze_and_trade", response_model=TradeResponse)
 async def analyze_and_trade(req: TradeRequest):
@@ -203,22 +284,23 @@ async def analyze_and_trade(req: TradeRequest):
         )
         
         # [Phase 32] 并发获取多维数据因子
-        logger.info("🌍 正在拉取宏观情绪与资金面因子...")
-        try:
-            # 模拟获取外部数据（后续可替换为真实的公共 API 调用）
-            fear_greed_index = 45  # 1-100，模拟数据
-            funding_rate = 0.01    # 资金费率，模拟数据
-            ls_ratio = 1.2         # 多空比，模拟数据
-            
-            macro_factors = (
-                f"【宏观与资金面因子】\n"
-                f"- Fear & Greed Index (恐慌贪婪指数): {fear_greed_index} (Neutral)\n"
-                f"- Funding Rate (资金费率): {funding_rate}%\n"
-                f"- Long/Short Ratio (多空比): {ls_ratio}\n"
-            )
-        except Exception as e:
-            logger.warning(f"获取宏观因子失败，使用默认值: {e}")
-            macro_factors = "【宏观与资金面因子】\n暂时无法获取宏观数据，请仅依赖技术面数据。"
+        logger.info("🌍 正在拉取多维因子占位上下文...")
+        factor_payload = await agent.build_multifactor_payload(req.symbol, req.timeframe)
+        macro_factors = agent.format_multifactor_prompt(factor_payload)
+        logger.info(
+            "DB_RECORD %s",
+            json.dumps(
+                {
+                    "module": "api_server",
+                    "event": "multifactor_context_built",
+                    "symbol": req.symbol,
+                    "timeframe": req.timeframe,
+                    "placeholder_mode": factor_payload.get("placeholder_mode", True),
+                    "generated_at": factor_payload.get("generated_at"),
+                },
+                ensure_ascii=False,
+            ),
+        )
         
         # 2. 提取记忆并组装 One-Shot Prompt
         past_memory = agent.memory_stream.get_last_memory(req.symbol)
@@ -233,20 +315,7 @@ async def analyze_and_trade(req: TradeRequest):
         # 3. 发起非流式极速推理 (因为是 API 调用，主系统不需要看打字机效果)
         logger.info("🧠 大模型正在进行极速推理...")
         
-        # [Phase 32] 动态读取最新的 system_prompt.txt
-        prompt_path = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')), "data", "system_prompt.txt")
-        try:
-            if os.path.exists(prompt_path):
-                with open(prompt_path, "r", encoding="utf-8") as f:
-                    dynamic_prompt = f.read()
-            else:
-                dynamic_prompt = agent.load_skill_sop()
-        except Exception as e:
-            logger.error(f"读取动态 prompt 失败，回退至默认 SOP: {e}")
-            dynamic_prompt = agent.load_skill_sop()
-            
-        system_prompt = dynamic_prompt
-        system_prompt += "\n\n【系统强制指令】\n在你开始任何交易分析前，必须首先阅读上方的 Strategy-SOP 规则。\n**分析行情时，只能调用 `get_full_market_context` 工具一次，不要尝试分开获取指标！**\n你必须在思考链 (Chain of Thought) 中明确展示你是如何将 HMM 状态、SMC 信号与资金面因子进行对齐的。绝对禁止在没有任何数据支撑的情况下瞎猜点位。"
+        system_prompt = agent.build_runtime_system_prompt()
         
         reply = ""
         

@@ -1,3 +1,5 @@
+# Execution Engine: Powered by ccxt.async_support (Codename: Hummingbot Gateway)
+
 import asyncio
 import json
 import os
@@ -221,12 +223,13 @@ class ExecutionEngine:
 engine = ExecutionEngine()
 
 @mcp.tool()
-@cached(cache=balance_cache, key=cache_key_builder)
 async def get_account_balance() -> str:
     """
-    [Agent 工具] 获取账户当前的资金情况 (USDT)。(内置 10s TTL 缓存)
+    [Agent 工具] 获取账户当前的资金情况 (USDT)。
+    (注：为了解决 asyncache 对无参函数的 cache_key_builder 传参错误，已暂时移除 @cached，
+     如果后续遇到限频，可改用内部类变量实现简单的 TTL)
     """
-    logger.info("🌐 [Cache Miss] 正在向交易所请求真实账户余额...")
+    logger.info("🌐 正在向交易所请求真实账户余额...")
     try:
         await engine.init_exchange()
         balance = await engine.get_balance()

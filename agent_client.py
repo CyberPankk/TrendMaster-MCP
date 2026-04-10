@@ -233,7 +233,11 @@ class TrendMasterAgent:
                 timeout=15.0
             )
             # result.content 是一个列表，通常第一个元素包含文本
-            return result.content[0].text
+            text = result.content[0].text
+            try:
+                return json.loads(text)
+            except Exception:
+                return text
         except Exception as e:
             logger.error(f"直接调用 {tool_name} 失败: {e}")
             return f"调用失败: {str(e)}"

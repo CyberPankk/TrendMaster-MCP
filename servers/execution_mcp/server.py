@@ -1,4 +1,4 @@
-# Execution Engine: Powered by ccxt.async_support (Codename: Hummingbot Gateway)
+# Execution Engine: Powered by ccxt.async_support
 
 import asyncio
 import json
@@ -58,16 +58,18 @@ RISK_CONFIG = {
     "MAX_POSITION_USD": float(os.getenv("MAX_POSITION_USD", 20000)),
     "MAX_SPREAD_PCT": float(os.getenv("MAX_SPREAD_PCT", 0.005)),
     "VOLATILITY_THRESHOLD": 0.02, # 波动率阈值 (2%)，超过则禁止市价单
-    "DRY_RUN_MODE": os.getenv("DRY_RUN_MODE", "True").lower() in ("true", "1", "yes")
+    "DRY_RUN_MODE": os.getenv("DRY_RUN_MODE", "False").lower() in ("true", "1", "yes")
 }
 
-logger.info(f"Execution-MCP 初始化完成. DRY_RUN_MODE: {RISK_CONFIG['DRY_RUN_MODE']}")
+if RISK_CONFIG["DRY_RUN_MODE"]:
+    logger.warning("⚠️ 当前处于 模拟盘(DRY RUN) 模式")
+else:
+    logger.info("🔥 当前处于 实盘(LIVE) 模式")
 
 class ExecutionEngine:
     def __init__(self, exchange_id='binanceusdm'):
         self.exchange_id = exchange_id
         self.ex = None
-        self.dry_run = str(os.getenv("DRY_RUN_MODE", "True")).lower() == "true"
         # 算法单配置
         self.twap_threshold = float(os.getenv("TWAP_THRESHOLD_USD", 2000))
         self.twap_chunk_size = float(os.getenv("TWAP_CHUNK_USD", 500))
@@ -111,14 +113,13 @@ class ExecutionEngine:
 
     async def init_exchange(self):
         if not self.ex:
-            logger.info("⏳ [Hummingbot] 正在后台线程执行沉重的引擎初始化...")
-            # 强行将 Hummingbot(CCXT) 的启动逻辑剥离到后台线程运行，彻底解放主事件循环
+            logger.info("⏳ [Execution Gateway] 正在后台线程执行沉重的引擎初始化...")
             self.ex = await asyncio.to_thread(self._do_init_sync)
             
             # 异步加载市场数据
-            logger.info("⏳ [Hummingbot] 正在后台任务中加载市场数据 (load_markets)...")
+            logger.info("⏳ [Execution Gateway] 正在后台任务中加载市场数据 (load_markets)...")
             await asyncio.create_task(self.ex.load_markets())
-            logger.info("✅ MCP 服务器已启动，事件循环无阻塞，正在后台加载 Hummingbot...")
+            logger.info("✅ Execution-MCP 已启动，事件循环无阻塞，市场数据已加载。")
 
     async def validate_risk(self, symbol: str, amount_usd: float, order_type: str = 'market', volatility: float = 0.0):
         """
@@ -201,7 +202,7 @@ class ExecutionEngine:
 
                 logger.info(f"⏳ TWAP [{task_id}] 第 {slice_count} 刀: 准备 {side} {symbol} ${current_slice_usd} (剩余未执行: ${remaining_usd})")
 
-                if self.dry_run:
+                if RISK_CONFIG["DRY_RUN_MODE"]:
                     logger.info(f"🛡️ [DRY-RUN] TWAP 模拟切片成交: {side} {symbol} ${current_slice_usd}")
                 else:
                     # 真实切片市价吃单
@@ -234,9 +235,9 @@ async def get_account_balance() -> str:
         await engine.init_exchange()
         balance = await engine.get_balance()
         logger.info(f"查询余额成功: {balance}")
-        return str(balance)
+        return json.dumps({"status": "success", "data": balance}, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"查询余额失败: {str(e)}")
+        logger.exception("查询余额失败")
         return MCPErrorResponse(status="error", error_code="BALANCE_QUERY_FAILED", message=str(e)).model_dump_json()
 
 @mcp.tool()
@@ -268,7 +269,7 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
         # 1. 执行前置风控
         is_safe, reason = await engine.validate_risk(symbol, amount_usd, order_type, volatility)
         if not is_safe:
-            logger.warn(f"风控拦截 ({symbol}): {reason}")
+            logger.warning(f"风控拦截 ({symbol}): {reason}")
             return MCPErrorResponse(status="rejected", error_code="RISK_CHECK_FAILED", message=reason).model_dump_json()
 
         # 2. 计算下单数量
@@ -303,7 +304,7 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
         # ⚠️ 核心安全拦截 (Dry-Run 模式检查)
         # ---------------------------------------------------------
         if RISK_CONFIG["DRY_RUN_MODE"]:
-            logger.warn(f"🛡️ [DRY-RUN 拦截] 模拟下单成功，未发送至交易所: {side.upper()} {symbol} {amount:.4f} @ {exec_price}")
+            logger.warning(f"🛡️ [DRY-RUN 拦截] 模拟下单成功，未发送至交易所: {side.upper()} {symbol} {amount:.4f} @ {exec_price}")
             
             # 主动清空余额缓存，确保下一次查询是最新数据
             balance_cache.clear()
@@ -311,20 +312,43 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
             
             # 模拟返回成功订单结构
             mock_order_id = f"mock_{int(time.time()*1000)}"
-            return str({
+            return json.dumps({
                 "status": "success_dry_run", 
+                "execution_mode": "dry_run",
                 "order_id": mock_order_id, 
                 "sl_order_id": f"{mock_order_id}_sl" if sl_price else None,
-                "filled": amount,
-                "average": exec_price,
+                "filled_qty": amount,
+                "average_price": exec_price,
+                "fee": 0.0,
                 "note": "This is a simulated order generated in DRY_RUN_MODE."
-            })
+            }, ensure_ascii=False)
 
         # 3. 发送物理主订单
-        if order_type == 'market':
-            order = await engine.ex.create_market_order(symbol, side, amount)
-        else:
-            order = await engine.ex.create_limit_order(symbol, side, amount, exec_price)
+        try:
+            if order_type == 'market':
+                order = await engine.ex.create_market_order(symbol, side, amount)
+            else:
+                order = await engine.ex.create_limit_order(symbol, side, amount, exec_price)
+        except (ccxt.AuthenticationError, ccxt.PermissionDenied) as e:
+            logger.exception(f"❌ [CCXT 认证失败] {type(e).__name__}: {e}")
+            execution_breaker.record_failure()
+            return MCPErrorResponse(status="error", error_code="AUTHENTICATION_ERROR", message=str(e)).model_dump_json()
+        except ccxt.InsufficientFunds as e:
+            logger.exception(f"❌ [CCXT 余额不足] {type(e).__name__}: {e}")
+            execution_breaker.record_failure()
+            return MCPErrorResponse(status="error", error_code="INSUFFICIENT_FUNDS", message=str(e)).model_dump_json()
+        except ccxt.InvalidOrder as e:
+            logger.exception(f"❌ [CCXT 非法订单] {type(e).__name__}: {e}")
+            execution_breaker.record_failure()
+            return MCPErrorResponse(status="error", error_code="INVALID_ORDER", message=str(e)).model_dump_json()
+        except ccxt.ExchangeError as e:
+            logger.exception(f"❌ [CCXT 交易所错误] {type(e).__name__}: {e}")
+            execution_breaker.record_failure()
+            return MCPErrorResponse(status="error", error_code="EXCHANGE_ERROR", message=str(e)).model_dump_json()
+        except Exception as e:
+            logger.exception(f"❌ [CCXT 未知下单错误] {type(e).__name__}: {e}")
+            execution_breaker.record_failure()
+            return MCPErrorResponse(status="error", error_code="CREATE_ORDER_FAILED", message=str(e)).model_dump_json()
             
         logger.info(f"主订单物理下单成功: ID={order['id']}, Status={order['status']}")
         
@@ -350,25 +374,31 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                 sl_order_id = sl_order['id']
                 logger.info(f"止损单设置成功: ID={sl_order_id} @ {sl_price}")
             except Exception as e:
-                logger.error(f"止损单设置失败 (主单已成): {str(e)}")
+                logger.exception(f"止损单设置失败 (主单已成): {str(e)}")
                 return MCPErrorResponse(status="partial_success", message=f"主单成功但止损失败: {str(e)}", data={"order_id": order['id']}).model_dump_json()
 
-        return str({
+        fee = 0.0
+        if isinstance(order.get("fee"), dict):
+            fee = float(order["fee"].get("cost") or 0.0)
+
+        return json.dumps({
             "status": "success",
+            "execution_mode": "live",
             "order_id": order['id'],
             "sl_order_id": sl_order_id,
-            "filled": order.get('filled', amount),
-            "average": order.get('average', exec_price)
-        })
+            "filled_qty": order.get('filled', amount),
+            "average_price": order.get('average', exec_price),
+            "fee": fee
+        }, ensure_ascii=False)
 
     except (ccxt.NetworkError, ccxt.ExchangeError) as e:
         # 网络或交易所异常，立刻触发熔断计数
         execution_breaker.record_failure()
-        logger.error(f"执行层网络崩溃: {str(e)}")
+        logger.exception(f"执行层网络崩溃: {str(e)}")
         return MCPErrorResponse(status="error", error_code="EXCHANGE_NETWORK_ERROR", message=f"交易所连接失败: {str(e)}").model_dump_json()
 
     except Exception as e:
-        logger.error(f"下单执行异常: {str(e)}")
+        logger.exception(f"下单执行异常: {str(e)}")
         return MCPErrorResponse(status="error", error_code="EXECUTION_ERROR", message=str(e)).model_dump_json()
 
 @mcp.tool()
@@ -382,7 +412,7 @@ async def kill_all_positions(symbol: str) -> str:
     
     try:
         await engine.init_exchange()
-        logger.warn(f"🚨 收到清仓指令: {symbol}")
+        logger.warning(f"🚨 收到清仓指令: {symbol}")
         
         # 1. 撤销所有挂单
         await engine.cancel_all_orders(symbol)
@@ -392,7 +422,7 @@ async def kill_all_positions(symbol: str) -> str:
         closed_count = await engine.close_all_positions(symbol)
         logger.info(f"已平仓 {symbol} 的 {closed_count} 个持仓。")
         
-        return str({"status": "success", "message": f"Kill switch executed for {symbol}. Orders cancelled, {closed_count} positions closed."})
+        return json.dumps({"status": "success", "message": f"Kill switch executed for {symbol}. Orders cancelled, {closed_count} positions closed."}, ensure_ascii=False)
 
     except Exception as e:
         logger.error(f"熔断失败: {str(e)}")
@@ -402,7 +432,7 @@ async def kill_all_positions(symbol: str) -> str:
 async def kill_all_positions_global() -> str:
     try:
         await engine.init_exchange()
-        logger.warn("🚨 收到全局清仓指令: GLOBAL")
+        logger.warning("🚨 收到全局清仓指令: GLOBAL")
 
         symbols = set()
         try:
@@ -444,7 +474,7 @@ async def kill_all_positions_global() -> str:
             except Exception as e:
                 errors.append({"symbol": sym, "stage": "close_all_positions", "error": str(e)})
 
-        return str(
+        return json.dumps(
             {
                 "status": "success",
                 "message": "Global kill switch executed.",
@@ -452,7 +482,8 @@ async def kill_all_positions_global() -> str:
                 "orders_cancelled_symbols": cancelled,
                 "positions_closed_count": closed,
                 "errors": errors,
-            }
+            },
+            ensure_ascii=False
         )
     except Exception as e:
         logger.error(f"全局熔断失败: {str(e)}")

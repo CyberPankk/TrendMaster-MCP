@@ -295,20 +295,23 @@ async def analyze_and_trade(req: TradeRequest):
                 # 安全解析 USDT 余额
                 usdt_balance = 0.0
                 if isinstance(balance_res, dict):
-                    if "data" in balance_res:
+                    if balance_res.get("status") == "success" and isinstance(balance_res.get("data"), dict):
+                        balance_data = balance_res["data"]
+                        usdt_balance = float(balance_data.get("free") or balance_data.get("total") or 0.0)
+                    elif "data" in balance_res:
                         import ast
                         try:
                             balance_data = ast.literal_eval(balance_res["data"])
-                            usdt_balance = float(balance_data.get("total", {}).get("USDT", 0.0))
+                            usdt_balance = float(balance_data.get("free") or balance_data.get("total") or 0.0)
                         except Exception:
                             usdt_balance = float(balance_res.get("data", 0.0))
                     else:
-                        usdt_balance = float(balance_res.get("total", {}).get("USDT", 0.0))
+                        usdt_balance = float(balance_res.get("free") or balance_res.get("total") or 0.0)
                 else:
                     import ast
                     try:
                         balance_data = ast.literal_eval(balance_res)
-                        usdt_balance = float(balance_data.get("total", {}).get("USDT", 0.0))
+                        usdt_balance = float(balance_data.get("free") or balance_data.get("total") or 0.0)
                     except Exception:
                         usdt_balance = float(balance_res)
                         
@@ -331,31 +334,43 @@ async def analyze_and_trade(req: TradeRequest):
                     "execute_smart_order", 
                     {"symbol": req.symbol, "side": action.lower(), "amount_usd": dynamic_amount}
                 )
-                exec_status = str(exec_res)
+                exec_status = json.dumps(exec_res, ensure_ascii=False) if isinstance(exec_res, dict) else str(exec_res)
+                exec_result = exec_res if isinstance(exec_res, dict) else {"status": "unknown", "message": str(exec_res)}
                 
                 # 推送 Telegram 战报
                 action_emoji = "🟢" if action == "BUY" else "🔴"
                 
                 # 尝试从执行结果提取均价
                 avg_price = "N/A"
-                if isinstance(exec_res, dict) and "data" in exec_res:
-                    import ast
-                    try:
-                        exec_data = ast.literal_eval(exec_res["data"])
-                        avg_price = f"${exec_data.get('average', 'N/A')}"
-                    except Exception:
-                        pass
+                if isinstance(exec_result, dict):
+                    avg_val = exec_result.get("average_price") or exec_result.get("average")
+                    if avg_val is not None:
+                        avg_price = f"${avg_val}"
 
-                report_msg = (
-                    f"🚀 *TrendMaster Quant 执行战报*\n\n"
-                    f"交易对：`{req.symbol}`\n"
-                    f"动作：{action_emoji} *{action}*\n"
-                    f"开仓金额：`${dynamic_amount:.2f}`\n"
-                    f"成交均价：{avg_price}\n"
-                    f"当前余额：`${usdt_balance:.2f}`\n\n"
-                    f"🧠 *AI 决策核心逻辑*：\n"
-                    f"_{reply[:500]}..._"
-                )
+                if exec_result.get("status") in {"success", "success_dry_run", "partial_success"}:
+                    report_msg = (
+                        f"🚀 *TrendMaster Quant 执行战报*\n\n"
+                        f"交易对：`{req.symbol}`\n"
+                        f"动作：{action_emoji} *{action}*\n"
+                        f"开仓金额：`${dynamic_amount:.2f}`\n"
+                        f"成交均价：{avg_price}\n"
+                        f"当前余额：`${usdt_balance:.2f}`\n\n"
+                        f"🧠 *AI 决策核心逻辑*：\n"
+                        f"_{reply[:500]}..._"
+                    )
+                else:
+                    fail_reason = exec_result.get("message") or exec_result.get("reason") or exec_result.get("error_code") or exec_status
+                    logger.error(f"❌ Execution-MCP 返回失败: {exec_result}")
+                    report_msg = (
+                        f"❌ *TrendMaster Quant 发单失败*\n\n"
+                        f"交易对：`{req.symbol}`\n"
+                        f"动作：{action_emoji} *{action}*\n"
+                        f"开仓金额：`${dynamic_amount:.2f}`\n"
+                        f"当前余额：`${usdt_balance:.2f}`\n"
+                        f"失败原因：`{fail_reason}`\n\n"
+                        f"🧠 *AI 决策核心逻辑*：\n"
+                        f"_{reply[:500]}..._"
+                    )
                 asyncio.create_task(send_tg_alert(report_msg))
                 
                 # 记录交易账本

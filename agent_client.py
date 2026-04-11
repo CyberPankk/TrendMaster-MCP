@@ -4,8 +4,7 @@ import json
 import sys
 import re
 from datetime import datetime
-from contextlib import AsyncExitStack
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 
 from anthropic import AsyncAnthropic
@@ -24,6 +23,33 @@ init(autoreset=True)
 load_dotenv(override=True)
 
 logger = get_logger("Agent-Client")
+
+DEFAULT_SYSTEM_PROMPT = """你是 TrendMaster PRO 的量化交易决策中枢，负责对加密货币市场进行审慎、可执行、可审计的分析。
+
+你的核心职责：
+1. 优先保护资金安全，任何信号必须先经过风险审查，再讨论收益空间。
+2. 必须综合技术面、资金面、情绪面和事件风险，避免只凭单一指标下结论。
+3. 当信息不完整、指标冲突、波动异常或存在重大事件风险时，默认输出 WAIT。
+4. 严禁臆测未提供的数据，严禁伪造价格、成交量、仓位、资金费率或新闻事件。
+5. 若市场结构与历史记忆冲突，应以最新数据为准，并说明冲突原因。
+
+你的分析顺序：
+1. 先识别趋势、波动、关键支撑阻力和市场结构。
+2. 再评估多维因子，包括恐慌贪婪、资金费率、多空比以及其他注入的上下文。
+3. 最后输出交易动作、核心逻辑、风险提示和无效条件。
+
+你的强制约束：
+1. 只允许基于输入中提供的数据进行推理，禁止假设已经调用了不存在的工具。
+2. 如果多维因子显示市场过热、拥挤或事件风险升高，必须下调激进程度。
+3. 如果出现高不确定性，必须明确写出为什么 WAIT 比交易更优。
+4. 不要输出模糊建议，必须给出清晰动作标签。
+
+你的输出必须包含以下 XML 标签：
+<ACTION>BUY|SELL|WAIT</ACTION>
+<REASONING>简洁说明技术面、多维因子与风险约束如何共同支持该决策</REASONING>
+<RISK>说明主要风险、失效条件或不确定性来源</RISK>
+
+请始终使用专业、克制、面向执行的语气。"""
 
 class AgentMemory:
     def __init__(self, filepath="agent_memory.json"):
@@ -103,6 +129,10 @@ class TrendMasterAgent:
         
         # 我们的 3 个微服务路径 (这里使用 python 命令启动)
         base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.base_dir = base_dir
+        self.repo_root = os.path.abspath(os.path.join(base_dir, "..", ".."))
+        self.system_prompt_path = os.path.join(self.repo_root, "data", "system_prompt.txt")
+        self.ensure_system_prompt_file()
         self.mcp_servers = {
             "Market": os.path.join(base_dir, "servers/market_mcp/server.py"),
             "Indicator": os.path.join(base_dir, "servers/indicator_mcp/server.py"),
@@ -112,13 +142,148 @@ class TrendMasterAgent:
             "Strategy": os.path.join(base_dir, "servers/strategy_mcp/server.py")
         }
 
+    def ensure_system_prompt_file(self) -> str:
+        """确保动态 Prompt 文件存在且可读，首次启动时自动写入默认模板。"""
+        os.makedirs(os.path.dirname(self.system_prompt_path), exist_ok=True)
+        if os.path.exists(self.system_prompt_path):
+            try:
+                with open(self.system_prompt_path, "r", encoding="utf-8") as file:
+                    if file.read().strip():
+                        return self.system_prompt_path
+            except Exception as exc:
+                logger.warning(f"读取现有 system_prompt.txt 失败，将重建默认模板: {exc}")
+
+        with open(self.system_prompt_path, "w", encoding="utf-8") as file:
+            file.write(DEFAULT_SYSTEM_PROMPT)
+        logger.info(f"✅ 已初始化动态 system_prompt.txt: {self.system_prompt_path}")
+        return self.system_prompt_path
+
+    def read_latest_system_prompt(self) -> str:
+        """读取仓库中的最新系统提示词，若不存在则回退到基础 SOP。"""
+        try:
+            self.ensure_system_prompt_file()
+            if os.path.exists(self.system_prompt_path):
+                with open(self.system_prompt_path, "r", encoding="utf-8") as file:
+                    content = file.read().strip()
+                if content:
+                    logger.info(f"✅ 已加载最新 system_prompt.txt: {self.system_prompt_path}")
+                    return content
+                logger.warning("⚠️ system_prompt.txt 为空，回退到默认模板")
+        except Exception as exc:
+            logger.error(f"读取最新 system prompt 失败，回退至默认模板: {exc}")
+
+        return DEFAULT_SYSTEM_PROMPT
+
+    def write_system_prompt(self, content: str) -> str:
+        """持久化写入 system_prompt.txt，供 API 与 Agent 热更新共用。"""
+        normalized_content = content.strip()
+        if not normalized_content:
+            raise ValueError("system_prompt.txt 内容不能为空")
+
+        os.makedirs(os.path.dirname(self.system_prompt_path), exist_ok=True)
+        with open(self.system_prompt_path, "w", encoding="utf-8") as file:
+            file.write(normalized_content)
+
+        logger.info(f"✅ system_prompt.txt 热更新完成: {self.system_prompt_path}")
+        return self.system_prompt_path
+
+    def build_runtime_system_prompt(self) -> str:
+        """组装运行时系统提示词，确保每轮都读取最新 Prompt。"""
+        return "\n\n".join(
+            [
+                self.read_latest_system_prompt(),
+                self.load_skill_sop(),
+                self.load_skill("Trend-Sniper"),
+                self.load_skill("Mean-Reversion"),
+                self.load_skill("Portfolio-Risk"),
+            ]
+        )
+
+    async def build_multifactor_payload(self, symbol: str, timeframe: str) -> Dict[str, Any]:
+        """构建多维因子占位载荷，并在可用时注入实时舆情结果。"""
+        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        factor_payload: Dict[str, Any] = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "generated_at": generated_at,
+            "placeholder_mode": True,
+            "fear_greed_index": {
+                "value": 75,
+                "classification": "Greed",
+                "source": "mock",
+            },
+            "funding_rate": {
+                "value": "0.01%",
+                "bias": "longs_paying_shorts",
+                "source": "mock",
+            },
+            "long_short_ratio": {
+                "value": 1.2,
+                "bias": "long_bias",
+                "source": "mock",
+            },
+            "factor_commentary": "当前为占位数据接入，后续可替换为真实交易所与情绪 API。"
+        }
+
+        if "get_comprehensive_sentiment" not in self.tool_routing_map:
+            return factor_payload
+
+        try:
+            sentiment_result = await self.call_mcp_tool_directly(
+                server_name="Sentiment-MCP",
+                tool_name="get_comprehensive_sentiment",
+                arguments={"symbol": symbol, "timeframe": timeframe},
+            )
+
+            parsed_sentiment: Any = sentiment_result
+            if isinstance(sentiment_result, str):
+                parsed_sentiment = json.loads(sentiment_result)
+
+            sentiment_block: Optional[Dict[str, Any]] = None
+            if isinstance(parsed_sentiment, dict):
+                sentiment_block = parsed_sentiment.get("fear_greed_index")
+                if sentiment_block is None and isinstance(parsed_sentiment.get("data"), dict):
+                    sentiment_block = parsed_sentiment["data"].get("fear_greed_index")
+
+            if isinstance(sentiment_block, dict):
+                factor_payload["fear_greed_index"] = {
+                    "value": sentiment_block.get("value", factor_payload["fear_greed_index"]["value"]),
+                    "classification": sentiment_block.get(
+                        "classification",
+                        factor_payload["fear_greed_index"]["classification"],
+                    ),
+                    "source": "sentiment_mcp",
+                }
+                factor_payload["placeholder_mode"] = False
+
+            factor_payload["sentiment_snapshot"] = parsed_sentiment
+            factor_payload["placeholder_mode"] = False
+        except Exception as exc:
+            logger.warning(f"⚠️ 多维因子实时注入失败，继续使用占位载荷: {exc}")
+
+        return factor_payload
+
+    def format_multifactor_prompt(self, factor_payload: Dict[str, Any]) -> str:
+        """将多维因子载荷格式化为稳定的 Prompt 注入块。"""
+        fear_greed = factor_payload.get("fear_greed_index", {})
+        funding_rate = factor_payload.get("funding_rate", {})
+        long_short_ratio = factor_payload.get("long_short_ratio", {})
+        data_mode = "mock" if factor_payload.get("placeholder_mode", True) else "mixed"
+        return (
+            "【多维因子上下文】\n"
+            f"- 数据模式: {data_mode}\n"
+            f"- 生成时间: {factor_payload.get('generated_at', 'N/A')}\n"
+            f"- Fear & Greed Index: {fear_greed.get('value', 'N/A')} - {fear_greed.get('classification', 'N/A')}\n"
+            f"- Funding Rate: {funding_rate.get('value', 'N/A')} ({funding_rate.get('bias', 'N/A')})\n"
+            f"- Long/Short Ratio: {long_short_ratio.get('value', 'N/A')} ({long_short_ratio.get('bias', 'N/A')})\n"
+            f"- 备注: {factor_payload.get('factor_commentary', '无')}"
+        )
+
     def load_skill_sop(self) -> str:
         """加载 Agent 的核心交易纪律"""
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        repo_root = os.path.abspath(os.path.join(base_dir, "..", ".."))
         try:
-            local_path = os.path.join(base_dir, "skills", "Strategy-SOP.skill")
-            root_path = os.path.join(repo_root, "skills", "Strategy-SOP.skill")
+            local_path = os.path.join(self.base_dir, "skills", "Strategy-SOP.skill")
+            root_path = os.path.join(self.repo_root, "skills", "Strategy-SOP.skill")
             path = local_path if os.path.exists(local_path) else root_path
             with open(path, "r", encoding="utf-8") as f:
                 sop = f.read()
@@ -141,10 +306,8 @@ class TrendMasterAgent:
             return safe_fallback
         try:
             filename = f"{skill_name}.skill"
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            repo_root = os.path.abspath(os.path.join(base_dir, "..", ".."))
-            local_path = os.path.join(base_dir, "skills", filename)
-            root_path = os.path.join(repo_root, "skills", filename)
+            local_path = os.path.join(self.base_dir, "skills", filename)
+            root_path = os.path.join(self.repo_root, "skills", filename)
             path = local_path if os.path.exists(local_path) else root_path
             with open(path, "r", encoding="utf-8") as f:
                 return f.read()
@@ -248,31 +411,8 @@ class TrendMasterAgent:
             # 启动所有连接，如果失败会抛出异常
             await self.init_mcp_connections()
             
-            # [Phase 32] 动态读取最新的 system_prompt.txt
-            prompt_path = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')), "data", "system_prompt.txt")
-            try:
-                if os.path.exists(prompt_path):
-                    with open(prompt_path, "r", encoding="utf-8") as f:
-                        dynamic_prompt = f.read()
-                else:
-                    dynamic_prompt = self.load_skill_sop()
-            except Exception as e:
-                logger.error(f"读取动态 prompt 失败，回退至默认 SOP: {e}")
-                dynamic_prompt = self.load_skill_sop()
-                
-            system_prompt = dynamic_prompt
-            
-            # [由于 agent_client 独有的多技能加载，我们仍保留这些附加技能]
-            system_prompt += "\n\n" + self.load_skill("Trend-Sniper")
-            system_prompt += "\n\n" + self.load_skill("Mean-Reversion")
-            system_prompt += "\n\n" + self.load_skill("Portfolio-Risk")
-            system_prompt += "\n\n【系统强制指令】\n在你开始任何交易分析前，必须首先阅读上方的 Strategy-SOP 规则。\n**分析行情时，只能调用 `get_full_market_context` 工具一次，不要尝试分开获取指标！**\n你必须在思考链 (Chain of Thought) 中明确展示你是如何将 HMM 状态、SMC 信号与资金面因子进行对齐的。绝对禁止在没有任何数据支撑的情况下瞎猜点位。"
-            system_prompt += "\n\n【舆情强制指令】\n当且仅当你准备输出 BUY/SELL 时，必须先调用一次 `get_comprehensive_sentiment` 获取舆情与宏观日历；若存在 impact=CRITICAL 的宏观事件，必须输出 WAIT。"
-            
             # OpenAI 格式需要将 system prompt 放入 messages 列表
-            messages = []
-            if self.llm_provider in ["deepseek", "ofox"]:
-                messages.append({"role": "system", "content": system_prompt})
+            messages: List[Dict[str, str]] = []
                 
             logger.info("\n" + "="*60)
             logger.info(f"{Fore.MAGENTA}🤖 TrendMaster 核心中枢已上线 (Powered by {self.llm_provider.upper()} & MCP){Style.RESET_ALL}")
@@ -289,6 +429,13 @@ class TrendMasterAgent:
                     break
                 if not user_input.strip():
                     continue
+
+                system_prompt = self.build_runtime_system_prompt()
+                if self.llm_provider in ["deepseek", "ofox"]:
+                    if messages and messages[0].get("role") == "system":
+                        messages[0]["content"] = system_prompt
+                    else:
+                        messages.insert(0, {"role": "system", "content": system_prompt})
                 
                 # 智能提取 Symbol (假设用户输入中包含 BTC 或 ETH 等)
                 symbol_to_analyze = "BTC/USDT" # 默认 fallback
@@ -322,17 +469,9 @@ class TrendMasterAgent:
                     logger.error("未找到 get_full_market_context 工具的路由映射")
                     
                 # [Phase 32] 补充获取多维宏观与资金面因子
-                logger.info(f"{Fore.YELLOW}🌍 正在拉取宏观情绪与资金面因子...{Style.RESET_ALL}")
-                fear_greed_index = 45  # 1-100，模拟数据
-                funding_rate = 0.01    # 资金费率，模拟数据
-                ls_ratio = 1.2         # 多空比，模拟数据
-                
-                macro_factors = (
-                    f"【宏观与资金面因子】\n"
-                    f"- Fear & Greed Index (恐慌贪婪指数): {fear_greed_index} (Neutral)\n"
-                    f"- Funding Rate (资金费率): {funding_rate}%\n"
-                    f"- Long/Short Ratio (多空比): {ls_ratio}\n"
-                )
+                logger.info(f"{Fore.YELLOW}🌍 正在构建多维因子上下文...{Style.RESET_ALL}")
+                factor_payload = await self.build_multifactor_payload(symbol_to_analyze, "1h")
+                macro_factors = self.format_multifactor_prompt(factor_payload)
                 logger.info(f"{Fore.GREEN}✅ 宏观与资金面因子已就绪，准备组装终极 Prompt{Style.RESET_ALL}")
                     
                 # 注入前置记忆

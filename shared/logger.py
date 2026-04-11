@@ -53,6 +53,10 @@ class QuantLogger:
         """记录 WARN 级别的日志"""
         self.logger.warning(f"{Fore.MAGENTA}WARN{Style.RESET_ALL}: {msg}")
 
+    def warning(self, msg: str):
+        """兼容 python 标准库的 warning 命名"""
+        self.warn(msg)
+
     def error(self, msg: str):
         """记录 ERROR 级别的日志"""
         self.logger.error(f"{Fore.RED}ERROR{Style.RESET_ALL}: {msg}")

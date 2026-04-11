@@ -81,6 +81,26 @@ class ExecutionEngine:
             logger.error("API Key or Secret not found in environment variables!")
             # 可以在这里抛出异常或在 init_exchange 时处理
 
+    def _extract_usdt_balance(self, balance: dict) -> dict:
+        usdt_direct = balance.get('USDT', {})
+        total_balance = usdt_direct.get('total')
+        free_balance = usdt_direct.get('free')
+        used_balance = usdt_direct.get('used')
+
+        if total_balance is None:
+            total_balance = balance.get('total', {}).get('USDT', 0.0)
+        if free_balance is None:
+            free_balance = balance.get('free', {}).get('USDT', 0.0)
+        if used_balance is None:
+            used_balance = balance.get('used', {}).get('USDT', 0.0)
+
+        return {
+            "asset": "USDT",
+            "total": float(total_balance or 0.0),
+            "free": float(free_balance or 0.0),
+            "used": float(used_balance or 0.0)
+        }
+
     def _do_init_sync(self):
         """后台线程中执行沉重的初始化 (同步)"""
         import ccxt
@@ -153,13 +173,7 @@ class ExecutionEngine:
     async def get_balance(self):
         await self.init_exchange()
         balance = await self.ex.fetch_balance()
-        # 假设我们主要关注 USDT
-        usdt_balance = balance.get('USDT', {})
-        return {
-            "total": usdt_balance.get('total', 0.0),
-            "free": usdt_balance.get('free', 0.0),
-            "used": usdt_balance.get('used', 0.0)
-        }
+        return self._extract_usdt_balance(balance)
     
     async def cancel_all_orders(self, symbol: str):
         await self.init_exchange()

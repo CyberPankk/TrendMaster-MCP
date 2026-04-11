@@ -2,3 +2,6 @@ mcp
 httpx
 cachetools
 asyncache
+beautifulsoup4
+feedparser
+lxml

@@ -1,6 +1,9 @@
 import sys
 import os
 import asyncio
+import importlib.util
+import numpy as np
+import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
@@ -52,6 +55,92 @@ from shared.logger import get_logger
 logger = get_logger("Factor-Lab-MCP")
 mcp = FastMCP("Factor-Lab-MCP")
 
+
+@mcp.tool()
+async def run_precompiled_backtest(strategy_name: str, symbol: str) -> dict:
+    """
+    运行预编译的策略双生子回测脚本 (Twin-Architecture Backtest)
+    动态加载 {strategy_name}_bt.py 或 shadow_pool/{strategy_name}_bt.py 并传入 Mock OHLCV 执行
+    """
+    logger.info(f"🚀 启动预编译回测 (Twin-Architecture): {strategy_name} on {symbol}")
+    
+    try:
+        skills_dir = os.path.join(PROJECT_ROOT, "skills")
+        shadow_pool_dir = os.path.join(skills_dir, "shadow_pool")
+        
+        bt_filename = f"{strategy_name}_bt.py"
+        main_path = os.path.join(skills_dir, bt_filename)
+        shadow_path = os.path.join(shadow_pool_dir, bt_filename)
+        
+        target_path = None
+        if os.path.exists(main_path):
+            target_path = main_path
+        elif os.path.exists(shadow_path):
+            target_path = shadow_path
+            
+        if not target_path:
+            logger.warning(f"预编译回测脚本未找到: {bt_filename}")
+            return {
+                "status": "error",
+                "error": f"找不到预编译的回测脚本: {bt_filename} (搜索了 skills 和 shadow_pool 目录)",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        # 动态加载模块
+        spec = importlib.util.spec_from_file_location(f"backtest_{strategy_name}", target_path)
+        if spec is None or spec.loader is None:
+            return {
+                "status": "error",
+                "error": f"无法加载模块 spec: {target_path}",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        bt_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bt_module)
+        
+        # 检查是否包含 run_backtest 函数
+        if not hasattr(bt_module, "run_backtest"):
+            return {
+                "status": "error",
+                "error": f"模块 {bt_filename} 缺少 'run_backtest(df)' 函数",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        # 生成 mock pandas DataFrame
+        dates = pd.date_range(end=datetime.now(), periods=1000, freq='1h')
+        
+        # 使用随机游走生成类似价格的数据
+        np.random.seed(42) # 可选：为了可复现
+        returns = np.random.normal(0, 0.01, 1000)
+        price_series = 100 * np.exp(returns.cumsum())
+        
+        mock_df = pd.DataFrame({
+            'open': price_series,
+            'high': price_series * (1 + np.abs(np.random.normal(0, 0.005, 1000))),
+            'low': price_series * (1 - np.abs(np.random.normal(0, 0.005, 1000))),
+            'close': price_series * (1 + np.random.normal(0, 0.002, 1000)),
+            'volume': np.random.randint(100, 10000, 1000)
+        }, index=dates)
+        
+        # 执行回测
+        logger.info(f"执行 {target_path} 中的 run_backtest 函数...")
+        result = await asyncio.to_thread(bt_module.run_backtest, mock_df)
+        
+        return {
+            "status": "success",
+            "strategy": strategy_name,
+            "symbol": symbol,
+            "backtest_result": result,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"预编译回测执行异常: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
 
 @mcp.tool()
 async def run_historical_backtest(strategy_name: str, symbol: str, timeframe: str, start_date: str, end_date: str) -> dict:

@@ -164,7 +164,7 @@ def get_exchange_timeout_ms() -> int:
     try:
         return max(int(raw_value), 1000)
     except ValueError:
-        logger.warning(f"INDICATOR_EXCHANGE_TIMEOUT_MS={raw_value} 非法，回退 8000ms")
+        logger.warn(f"INDICATOR_EXCHANGE_TIMEOUT_MS={raw_value} 非法，回退 8000ms")
         return 8000
 
 
@@ -174,7 +174,7 @@ def get_public_rest_timeout_seconds() -> float:
     try:
         return max(float(raw_value), 0.5)
     except ValueError:
-        logger.warning(f"INDICATOR_PUBLIC_REST_TIMEOUT_SECONDS={raw_value} 非法，回退 1.5s")
+        logger.warn(f"INDICATOR_PUBLIC_REST_TIMEOUT_SECONDS={raw_value} 非法，回退 1.5s")
         return 1.5
 
 
@@ -189,7 +189,7 @@ def get_kronos_local_timeout_seconds() -> float:
     try:
         return max(float(raw_value), 1.0)
     except ValueError:
-        logger.warning(f"KRONOS_LOCAL_TIMEOUT_SECONDS={raw_value} 非法，回退 12s")
+        logger.warn(f"KRONOS_LOCAL_TIMEOUT_SECONDS={raw_value} 非法，回退 12s")
         return 12.0
 
 
@@ -207,7 +207,7 @@ async def execute_exchange_request(
         is_allowed, breaker_state = breaker.allow_request()
         if not is_allowed:
             skipped_routes.append(f"{route_name}({breaker_state})")
-            logger.warning(
+            logger.warn(
                 f"[Binance-Official-SDK] ⏭️ {request_name} 跳过 {route_name} 链路，原因: 熔断器={breaker_state}"
             )
             continue
@@ -231,7 +231,7 @@ async def execute_exchange_request(
         except Exception as exc:
             last_error = exc
             breaker.record_failure(exc)
-            logger.warning(
+            logger.warn(
                 f"[Binance-Official-SDK] ⚠️ {request_name} 通过 {route_name} 链路失败，将尝试下一条链路: {exc}"
             )
         finally:
@@ -332,12 +332,12 @@ async def fetch_rest_ohlcv(
         ]
         return normalized_ohlcv, route_name
     except httpx.TimeoutException as timeout_error:
-        logger.warning(
+        logger.warn(
             f"[Hummingbot-Gateway] ⏱️ Indicator 本地 HTTP OHLCV 超时 ({get_public_rest_timeout_seconds():.1f}s)，"
             f"回退官方 SDK: {timeout_error}"
         )
     except Exception as local_http_error:
-        logger.warning(
+        logger.warn(
             f"[Hummingbot-Gateway] ⚠️ Indicator 本地 HTTP OHLCV 失败，回退官方 SDK: {local_http_error}"
         )
 
@@ -449,12 +449,12 @@ async def fetch_rest_market_snapshot(
             klines_route,
         )
     except httpx.TimeoutException as timeout_error:
-        logger.warning(
+        logger.warn(
             f"[Hummingbot-Gateway] ⏱️ Indicator 本地 HTTP 市场快照超时 ({get_public_rest_timeout_seconds():.1f}s)，"
             f"回退官方 SDK: {timeout_error}"
         )
     except Exception as local_http_error:
-        logger.warning(
+        logger.warn(
             f"[Hummingbot-Gateway] ⚠️ Indicator 本地 HTTP 市场快照失败，回退官方 SDK: {local_http_error}"
         )
 

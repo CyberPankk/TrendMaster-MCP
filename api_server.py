@@ -288,8 +288,7 @@ async def analyze_and_trade(req: TradeRequest):
         factor_payload = await agent.build_multifactor_payload(req.symbol, req.timeframe)
         macro_factors = agent.format_multifactor_prompt(factor_payload)
         logger.info(
-            "DB_RECORD %s",
-            json.dumps(
+            "DB_RECORD " + json.dumps(
                 {
                     "module": "api_server",
                     "event": "multifactor_context_built",
@@ -299,7 +298,7 @@ async def analyze_and_trade(req: TradeRequest):
                     "generated_at": factor_payload.get("generated_at"),
                 },
                 ensure_ascii=False,
-            ),
+            )
         )
         
         # 2. 提取记忆并组装 One-Shot Prompt

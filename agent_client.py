@@ -13,6 +13,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from colorama import Fore, Style, init
 
+from shared.data_fetcher import fetch_fear_and_greed, fetch_funding_rate
 from shared.logger import get_logger
 from openai_client import DeepSeekAdapter # 导入适配器
 
@@ -132,7 +133,9 @@ class TrendMasterAgent:
         self.base_dir = base_dir
         self.repo_root = os.path.abspath(os.path.join(base_dir, "..", ".."))
         self.system_prompt_path = os.path.join(self.repo_root, "data", "system_prompt.txt")
+        self.feed_config_path = os.path.join(self.repo_root, "data", "feed_config.json")
         self.ensure_system_prompt_file()
+        self.ensure_feed_config_file()
         self.mcp_servers = {
             "Market": os.path.join(base_dir, "servers/market_mcp/server.py"),
             "Indicator": os.path.join(base_dir, "servers/indicator_mcp/server.py"),
@@ -157,6 +160,52 @@ class TrendMasterAgent:
             file.write(DEFAULT_SYSTEM_PROMPT)
         logger.info(f"✅ 已初始化动态 system_prompt.txt: {self.system_prompt_path}")
         return self.system_prompt_path
+
+    def ensure_feed_config_file(self) -> str:
+        os.makedirs(os.path.dirname(self.feed_config_path), exist_ok=True)
+        default_config = {
+            "fear_greed": True,
+            "funding_rate": False,
+            "long_short": False,
+        }
+        if os.path.exists(self.feed_config_path):
+            try:
+                with open(self.feed_config_path, "r", encoding="utf-8") as file:
+                    loaded = json.load(file)
+                if isinstance(loaded, dict):
+                    normalized = {
+                        "fear_greed": bool(loaded.get("fear_greed", default_config["fear_greed"])),
+                        "funding_rate": bool(loaded.get("funding_rate", default_config["funding_rate"])),
+                        "long_short": bool(loaded.get("long_short", default_config["long_short"])),
+                    }
+                    with open(self.feed_config_path, "w", encoding="utf-8") as file:
+                        json.dump(normalized, file, indent=2, ensure_ascii=False)
+                    return self.feed_config_path
+            except Exception as exc:
+                logger.warning(f"读取现有 feed_config.json 失败，将重建默认配置: {exc}")
+
+        with open(self.feed_config_path, "w", encoding="utf-8") as file:
+            json.dump(default_config, file, indent=2, ensure_ascii=False)
+        logger.info(f"✅ 已初始化 feed_config.json: {self.feed_config_path}")
+        return self.feed_config_path
+
+    def read_feed_config(self) -> Dict[str, bool]:
+        self.ensure_feed_config_file()
+        try:
+            with open(self.feed_config_path, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            return {
+                "fear_greed": bool(loaded.get("fear_greed", True)),
+                "funding_rate": bool(loaded.get("funding_rate", False)),
+                "long_short": bool(loaded.get("long_short", False)),
+            }
+        except Exception as exc:
+            logger.warning(f"读取 feed_config.json 失败，回退默认配置: {exc}")
+            return {
+                "fear_greed": True,
+                "funding_rate": False,
+                "long_short": False,
+            }
 
     def read_latest_system_prompt(self) -> str:
         """读取仓库中的最新系统提示词，若不存在则回退到基础 SOP。"""
@@ -200,84 +249,65 @@ class TrendMasterAgent:
         )
 
     async def build_multifactor_payload(self, symbol: str, timeframe: str) -> Dict[str, Any]:
-        """构建多维因子占位载荷，并在可用时注入实时舆情结果。"""
+        """按配置构建真实多维因子载荷，禁止注入假数据。"""
         generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        feed_config = self.read_feed_config()
         factor_payload: Dict[str, Any] = {
             "symbol": symbol,
             "timeframe": timeframe,
             "generated_at": generated_at,
-            "placeholder_mode": True,
-            "fear_greed_index": {
-                "value": 75,
-                "classification": "Greed",
-                "source": "mock",
-            },
-            "funding_rate": {
-                "value": "0.01%",
-                "bias": "longs_paying_shorts",
-                "source": "mock",
-            },
-            "long_short_ratio": {
-                "value": 1.2,
-                "bias": "long_bias",
-                "source": "mock",
-            },
-            "factor_commentary": "当前为占位数据接入，后续可替换为真实交易所与情绪 API。"
+            "feed_config": feed_config,
+            "factor_lines": [],
         }
 
-        if "get_comprehensive_sentiment" not in self.tool_routing_map:
-            return factor_payload
+        async_tasks: List[tuple[str, asyncio.Future]] = []
+        if feed_config.get("fear_greed"):
+            async_tasks.append(("fear_greed", asyncio.create_task(fetch_fear_and_greed())))
+        if feed_config.get("funding_rate"):
+            async_tasks.append(("funding_rate", asyncio.create_task(fetch_funding_rate(symbol))))
 
-        try:
-            sentiment_result = await self.call_mcp_tool_directly(
-                server_name="Sentiment-MCP",
-                tool_name="get_comprehensive_sentiment",
-                arguments={"symbol": symbol, "timeframe": timeframe},
-            )
+        if async_tasks:
+            results = await asyncio.gather(*(task for _, task in async_tasks), return_exceptions=True)
+            for (factor_name, _), result in zip(async_tasks, results):
+                if isinstance(result, Exception) or result is None:
+                    logger.warning(f"⚠️ 真实因子 {factor_name} 拉取失败，已跳过该维度")
+                    continue
 
-            parsed_sentiment: Any = sentiment_result
-            if isinstance(sentiment_result, str):
-                parsed_sentiment = json.loads(sentiment_result)
+                if factor_name == "fear_greed":
+                    factor_payload["fear_greed_index"] = result
+                    factor_payload["factor_lines"].append(
+                        f"当前市场恐慌贪婪指数为 {result['value']} ({result['classification']})。"
+                    )
+                elif factor_name == "funding_rate":
+                    factor_payload["funding_rate"] = result
+                    factor_payload["factor_lines"].append(
+                        f"当前 {result['symbol']} 资金费率为 {result['formatted']}。"
+                    )
 
-            sentiment_block: Optional[Dict[str, Any]] = None
-            if isinstance(parsed_sentiment, dict):
-                sentiment_block = parsed_sentiment.get("fear_greed_index")
-                if sentiment_block is None and isinstance(parsed_sentiment.get("data"), dict):
-                    sentiment_block = parsed_sentiment["data"].get("fear_greed_index")
-
-            if isinstance(sentiment_block, dict):
-                factor_payload["fear_greed_index"] = {
-                    "value": sentiment_block.get("value", factor_payload["fear_greed_index"]["value"]),
-                    "classification": sentiment_block.get(
-                        "classification",
-                        factor_payload["fear_greed_index"]["classification"],
-                    ),
-                    "source": "sentiment_mcp",
-                }
-                factor_payload["placeholder_mode"] = False
-
-            factor_payload["sentiment_snapshot"] = parsed_sentiment
-            factor_payload["placeholder_mode"] = False
-        except Exception as exc:
-            logger.warning(f"⚠️ 多维因子实时注入失败，继续使用占位载荷: {exc}")
+        factor_payload["enabled_factors"] = [
+            key for key, enabled in feed_config.items() if enabled
+        ]
 
         return factor_payload
 
     def format_multifactor_prompt(self, factor_payload: Dict[str, Any]) -> str:
         """将多维因子载荷格式化为稳定的 Prompt 注入块。"""
-        fear_greed = factor_payload.get("fear_greed_index", {})
-        funding_rate = factor_payload.get("funding_rate", {})
-        long_short_ratio = factor_payload.get("long_short_ratio", {})
-        data_mode = "mock" if factor_payload.get("placeholder_mode", True) else "mixed"
-        return (
-            "【多维因子上下文】\n"
-            f"- 数据模式: {data_mode}\n"
-            f"- 生成时间: {factor_payload.get('generated_at', 'N/A')}\n"
-            f"- Fear & Greed Index: {fear_greed.get('value', 'N/A')} - {fear_greed.get('classification', 'N/A')}\n"
-            f"- Funding Rate: {funding_rate.get('value', 'N/A')} ({funding_rate.get('bias', 'N/A')})\n"
-            f"- Long/Short Ratio: {long_short_ratio.get('value', 'N/A')} ({long_short_ratio.get('bias', 'N/A')})\n"
-            f"- 备注: {factor_payload.get('factor_commentary', '无')}"
-        )
+        factor_lines = list(factor_payload.get("factor_lines", []))
+        enabled_factors = factor_payload.get("enabled_factors", [])
+
+        prompt_lines = [
+            "【多维因子上下文】",
+            f"- 生成时间: {factor_payload.get('generated_at', 'N/A')}",
+        ]
+
+        if factor_lines:
+            prompt_lines.extend(f"- {line}" for line in factor_lines)
+        elif enabled_factors:
+            prompt_lines.append("- 已启用真实因子，但本轮拉取失败，禁止以假数据代替。")
+        else:
+            prompt_lines.append("- 当前未启用额外真实因子开关。")
+
+        return "\n".join(prompt_lines)
 
     def load_skill_sop(self) -> str:
         """加载 Agent 的核心交易纪律"""

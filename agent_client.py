@@ -13,6 +13,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from colorama import Fore, Style, init
 
+from shared.audit_feedback import format_order_lessons_context, get_recent_order_lessons
 from shared.data_fetcher import fetch_fear_and_greed, fetch_funding_rate
 from shared.logger import get_logger
 from openai_client import DeepSeekAdapter # 导入适配器
@@ -309,6 +310,16 @@ class TrendMasterAgent:
 
         return "\n".join(prompt_lines)
 
+    async def build_experience_context(self, symbol: str, limit: int = 5) -> str:
+        """读取最近实战教训并格式化为尾部唤醒块，避免经验池与 Skill 混写。"""
+        lessons = await get_recent_order_lessons(limit=limit, symbol=symbol)
+        return format_order_lessons_context(lessons)
+
+    async def build_decision_context_prefix(self, symbol: str, limit: int = 5) -> str:
+        """只返回短期记忆前缀，确保长期经验池仅注入到 user_message 尾部。"""
+        del limit
+        return self.memory_stream.get_last_memory(symbol)
+
     def load_skill_sop(self) -> str:
         """加载 Agent 的核心交易纪律"""
         try:
@@ -504,16 +515,18 @@ class TrendMasterAgent:
                 macro_factors = self.format_multifactor_prompt(factor_payload)
                 logger.info(f"{Fore.GREEN}✅ 宏观与资金面因子已就绪，准备组装终极 Prompt{Style.RESET_ALL}")
                     
-                # 注入前置记忆
-                past_memory = self.memory_stream.get_last_memory(symbol_to_analyze)
+                # 记忆流与经验池严格分离：短期记忆放前缀，长期经验池放 user_message 尾部
+                memory_context = await self.build_decision_context_prefix(symbol_to_analyze)
+                lesson_context = await self.build_experience_context(symbol_to_analyze, limit=5)
                 
                 # 组装终极 Prompt
                 enriched_input = (
-                    f"{past_memory}\n\n"
+                    f"{memory_context}\n\n"
                     f"【系统强制注入的底层技术数据】\n{fat_data}\n\n"
                     f"{macro_factors}\n\n"
                     f"当前长官指令：{user_input}\n"
-                    f"请直接综合上述【技术面】与【资金面】数据输出最终交易决策，严禁调用任何外部工具！"
+                    f"请直接综合上述【技术面】与【资金面】数据输出最终交易决策，严禁调用任何外部工具！\n\n"
+                    f"{lesson_context}"
                 )
                     
                 # 统一添加 User Message

@@ -288,7 +288,8 @@ async def analyze_and_trade(req: TradeRequest):
         factor_payload = await agent.build_multifactor_payload(req.symbol, req.timeframe)
         macro_factors = agent.format_multifactor_prompt(factor_payload)
         logger.info(
-            "DB_RECORD " + json.dumps(
+            "DB_RECORD %s",
+            json.dumps(
                 {
                     "module": "api_server",
                     "event": "multifactor_context_built",
@@ -298,13 +299,13 @@ async def analyze_and_trade(req: TradeRequest):
                     "generated_at": factor_payload.get("generated_at"),
                 },
                 ensure_ascii=False,
-            )
+            ),
         )
         
-        # 2. 提取记忆并组装 One-Shot Prompt
-        past_memory = agent.memory_stream.get_last_memory(req.symbol)
+        # 2. 提取记忆与失败单经验池，并组装 One-Shot Prompt
+        experience_context = await agent.build_decision_context_prefix(req.symbol)
         enriched_input = (
-            f"{past_memory}\n\n"
+            f"{experience_context}\n\n"
             f"【系统强制注入的底层技术数据】\n{fat_data}\n\n"
             f"{macro_factors}\n\n"
             f"当前主系统指令：{req.instruction}，计划开仓金额：{req.amount_usd} USDT\n"

@@ -412,7 +412,7 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
         return MCPErrorResponse(status="error", error_code="EXCHANGE_NETWORK_ERROR", message=f"交易所连接失败: {str(e)}").model_dump_json()
 
     except Exception as e:
-        logger.exception(f"下单执行异常: {str(e)}")
+        logger.error(f"下单执行异常: {str(e)}")
         return MCPErrorResponse(status="error", error_code="EXECUTION_ERROR", message=str(e)).model_dump_json()
 
 @mcp.tool()

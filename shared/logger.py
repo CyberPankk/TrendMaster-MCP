@@ -61,6 +61,10 @@ class QuantLogger:
         """记录 ERROR 级别的日志"""
         self.logger.error(f"{Fore.RED}ERROR{Style.RESET_ALL}: {msg}")
 
+    def exception(self, msg: str):
+        """兼容 python 标准库的 exception 命名，保留完整异常栈。"""
+        self.logger.exception(f"{Fore.RED}ERROR{Style.RESET_ALL}: {msg}")
+
 # 导出工具方法
 def get_logger(service_name: str) -> QuantLogger:
     """

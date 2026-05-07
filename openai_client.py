@@ -14,13 +14,13 @@ class DeepSeekAdapter:
         self.provider = provider
         
         if provider == "ofox":
-            self.api_key = os.getenv("OFOX_API_KEY")
+            self.api_key = os.getenv("OFOX_API_KEY") or os.getenv("OPENAI_API_KEY")
             self.base_url = os.getenv("OFOX_BASE_URL", "https://api.ofox.ai/v1")
-            self.model = os.getenv("OFOX_MODEL", "openai/gpt-5.4-mini")
+            self.model = os.getenv("LLM_MODEL_FAST") or os.getenv("OFOX_MODEL", "openai/gpt-5.4-mini")
         else:
-            self.api_key = os.getenv("SILICONFLOW_API_KEY")
-            self.base_url = os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
-            self.model = os.getenv("SILICONFLOW_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2")
+            self.api_key = os.getenv("SILICONFLOW_API_KEY") or os.getenv("OFOX_API_KEY") or os.getenv("OPENAI_API_KEY")
+            self.base_url = os.getenv("SILICONFLOW_BASE_URL") or os.getenv("OFOX_BASE_URL", "https://api.siliconflow.cn/v1")
+            self.model = os.getenv("LLM_MODEL_FAST") or os.getenv("SILICONFLOW_MODEL") or os.getenv("OFOX_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2")
         
         if not self.api_key:
             logger.error(f"未找到 {provider.upper()}_API_KEY，适配器无法初始化！")

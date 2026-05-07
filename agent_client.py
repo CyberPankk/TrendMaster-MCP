@@ -12,6 +12,18 @@ from anthropic.types.message_param import MessageParam
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from colorama import Fore, Style, init
+import sys
+import os
+
+# 将项目根目录加入 sys.path
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+# 将当前目录加入 sys.path 以解决同级模块导入问题
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
 from shared.audit_feedback import format_order_lessons_context, get_recent_order_lessons
 from shared.data_fetcher import fetch_fear_and_greed, fetch_funding_rate
@@ -103,7 +115,7 @@ class AgentMemory:
 
 class TrendMasterAgent:
     def __init__(self):
-        self.llm_provider = os.getenv("LLM_PROVIDER", "anthropic").lower()
+        self.llm_provider = os.getenv("LLM_PROVIDER", "siliconflow").lower()
         logger.info(f"🚀 当前使用的 LLM 提供商: {Fore.GREEN}{self.llm_provider.upper()}{Style.RESET_ALL}")
 
         if self.llm_provider == "anthropic":
@@ -112,7 +124,7 @@ class TrendMasterAgent:
                 logger.error("未找到 ANTHROPIC_API_KEY，请检查 .env 文件")
                 sys.exit(1)
             self.anthropic = AsyncAnthropic(api_key=api_key)
-        elif self.llm_provider in ["deepseek", "ofox"]:
+        elif self.llm_provider in ["deepseek", "ofox", "siliconflow"]:
             # 使用 OpenAI 兼容适配器
             self.deepseek = DeepSeekAdapter(provider=self.llm_provider)
         else:

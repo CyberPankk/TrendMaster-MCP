@@ -15,11 +15,15 @@ from pydantic import BaseModel
 import uvicorn
 from shared.logger import get_logger
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from decimal import Decimal
+import uuid
 
 # 引入我们已经打磨完美的 Agent 核心组件
 from agent_client import TrendMasterAgent 
 from shared.telegram_notifier import send_tg_alert
 from shared.db_manager import init_db, insert_trade_log, get_today_summary, get_recent_shadow_trades, get_system_metrics
+from shared.shadow_ledger import ShadowLedger, estimate_cost_usdt, safe_decimal
+from mvp_system.core.dynamic_allocator import DynamicAllocator
 from datetime import datetime
 from skills_pool.shadow.shadow_manager import ShadowPoolManager
 from skills_pool.lifecycle_manager import StrategyLifecycleManager
@@ -27,6 +31,14 @@ from skills_pool.lifecycle_manager import StrategyLifecycleManager
 logger = get_logger("API-Gateway")
 
 app = FastAPI(title="TrendMaster Quant 4.0 API", version="1.0")
+
+# 实例化动态资金分配器
+dynamic_allocator = DynamicAllocator(config={
+    "risk_control": {
+        "base_risk_pct": 0.05,
+        "max_position_pct": 0.15
+    }
+})
 
 # 配置 CORS 允许前端跨域访问
 app.add_middleware(
@@ -41,6 +53,8 @@ agent = TrendMasterAgent()
 scheduler = AsyncIOScheduler()
 shadow_manager = ShadowPoolManager()
 lifecycle_manager = StrategyLifecycleManager()
+shadow_ledger = ShadowLedger(initial_usdt=safe_decimal(os.getenv("SHADOW_LEDGER_INITIAL_USDT", "0")))
+shadow_ledger_enabled = os.getenv("SHADOW_LEDGER_ENABLED", "true").lower() in ("true", "1", "yes")
 
 START_TIME = time.time()
 
@@ -98,54 +112,85 @@ async def system_resume():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ======= 新增配置：被监控与交易的目标代币池 =======
+# 动态读取共享配置
+def get_target_symbols():
+    symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    import json, os
+    symbols_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "monitored_symbols.json")
+    if os.path.exists(symbols_file):
+        try:
+            with open(symbols_file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                if isinstance(saved, list) and len(saved) > 0:
+                    symbols = saved
+        except Exception:
+            pass
+    return symbols
+
 async def run_shadow_pool_job():
     """沙盒策略池自动巡航任务"""
-    logger.info("👻 [Shadow-Pool] 触发定时沙盒巡航...")
+    target_symbols = get_target_symbols()
+    logger.info(f"👻 [Shadow-Pool] 触发定时沙盒巡航，目标交易对: {target_symbols}...")
     try:
         # 1. 尝试动态加载最新策略（支持热更新）
         shadow_manager.load_skills()
-        
-        # 2. 获取行情数据，这里复用已有的工具逻辑
-        # 假设沙盒默认分析 BTC/USDT 的 1h K线数据
-        symbol = "BTC/USDT"
         timeframe = "1h"
         
-        # 调用 Indicator-MCP 获取 K线数据（复用已有能力）
-        logger.info(f"👻 [Shadow-Pool] 正在获取 {symbol} 行情数据供沙盒分析...")
-        klines_data = await agent.call_mcp_tool_directly(
-            "Indicator-MCP", 
-            "get_full_market_context", 
-            {"symbol": symbol, "timeframe": timeframe}
-        )
-        
-        # 尝试获取当前最新价格，如果无法获取，可以用一个占位符，或者尝试解析 klines_data
-        # 这里我们调用 Market-MCP 或直接在数据中获取
-        current_price = 0.0
-        try:
-            ticker_res = await agent.call_mcp_tool_directly("Market-MCP", "get_ticker", {"symbol": symbol})
-            if isinstance(ticker_res, dict) and "data" in ticker_res:
-                import ast
-                ticker_data = ast.literal_eval(ticker_res["data"])
-                current_price = float(ticker_data.get("last", 0.0))
-            elif isinstance(ticker_res, dict):
-                current_price = float(ticker_res.get("last", 0.0))
-        except Exception as e:
-            logger.warning(f"⚠️ [Shadow-Pool] 获取最新价格失败，将使用默认价格 0.0: {e}")
+        # 2. 遍历所有配置的交易对，获取行情数据并驱动沙盒
+        for symbol in target_symbols:
+            logger.info(f"👻 [Shadow-Pool] 正在获取 {symbol} 行情数据供沙盒分析...")
+            try:
+                # 调用 Indicator-MCP 获取 K线数据（复用已有能力）
+                klines_data = await agent.call_mcp_tool_directly(
+                    "Indicator-MCP", 
+                    "get_full_market_context", 
+                    {"symbol": symbol, "timeframe": timeframe}
+                )
+                
+                # 尝试获取当前最新价格，如果无法获取，可以用一个占位符，或者尝试解析 klines_data
+                # 这里我们调用 Market-MCP 或直接在数据中获取
+                current_price = 0.0
+                try:
+                    ticker_res = await agent.call_mcp_tool_directly("Market-MCP", "get_ticker", {"symbol": symbol})
+                    if isinstance(ticker_res, dict) and "data" in ticker_res:
+                        import ast
+                        ticker_data = ast.literal_eval(ticker_res["data"])
+                        current_price = float(ticker_data.get("last", 0.0))
+                    elif isinstance(ticker_res, dict):
+                        current_price = float(ticker_res.get("last", 0.0))
+                except Exception as e:
+                    logger.warning(f"⚠️ [Shadow-Pool] {symbol} 获取最新价格失败，将使用默认价格 0.0: {e}")
+                    
+                # 3. 驱动沙盒管理器执行虚拟交易
+                await shadow_manager.execute_virtual_trading(klines_data, current_price)
+                
+            except Exception as e:
+                logger.error(f"❌ [Shadow-Pool] {symbol} 沙盒执行异常: {e}")
             
-        # 3. 驱动沙盒管理器执行虚拟交易
-        await shadow_manager.execute_virtual_trading(klines_data, current_price)
-        
+            # API 限频保护机制：每个币种错峰请求
+            await asyncio.sleep(3.0)
+            
     except Exception as e:
         logger.error(f"❌ [Shadow-Pool] 沙盒巡航任务异常崩溃: {e}")
 
 async def auto_cruise_job():
     """后台自动巡航任务"""
-    logger.info("⚙️ [Auto-Cruise] 触发定时巡航...")
+    logger.info(f"⚙️ [Auto-Cruise] 触发定时巡航，目标交易对: {TARGET_SYMBOLS}...")
     try:
-        req = TradeRequest(symbol="BTC/USDT", timeframe="1h")
-        await analyze_and_trade(req)
+        for symbol in TARGET_SYMBOLS:
+            logger.info(f"🔍 [Auto-Cruise] 正在执行巡航任务: {symbol}")
+            try:
+                req = TradeRequest(symbol=symbol, timeframe="1h")
+                await analyze_and_trade(req)
+            except Exception as e:
+                logger.error(f"❌ [Auto-Cruise] {symbol} 巡航任务异常: {e}")
+            
+            # 增加异步休眠以错峰请求，严防限流封禁
+            await asyncio.sleep(3.0)
+            
     except Exception as e:
-        logger.error(f"❌ [Auto-Cruise] 巡航任务异常崩溃: {e}")
+        logger.error(f"❌ [Auto-Cruise] 巡航任务全局异常崩溃: {e}")
 
 async def daily_report_job():
     """每日量化财报推送任务"""
@@ -270,6 +315,17 @@ async def api_get_shadow_metrics():
         logger.error(f"获取系统指标失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/v1/shadow/ledger")
+async def api_get_shadow_ledger_snapshot():
+    """透出影子账本资金预扣快照，便于前端与审计定位并发超卖风险。"""
+    try:
+        snapshot = await shadow_ledger.get_snapshot()
+        return {"success": True, "data": snapshot, "enabled": shadow_ledger_enabled}
+    except Exception as e:
+        logger.error(f"获取影子账本快照失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/v1/analyze_and_trade", response_model=TradeResponse)
 async def analyze_and_trade(req: TradeRequest):
     logger.info(f"📥 收到主系统调用请求: {req.symbol}")
@@ -349,8 +405,25 @@ async def analyze_and_trade(req: TradeRequest):
             raise HTTPException(status_code=500, detail=f"Unsupported LLM provider: {agent.llm_provider}")
         
         # 4. 解析 Action 并归档记忆
-        action_match = re.search(r'<ACTION>([A-Z]+)</ACTION>', reply, re.IGNORECASE)
-        action = action_match.group(1).upper() if action_match else "UNKNOWN"
+        # 尝试 JSON 解析，兼容 markdown wrapper
+        reply_cleaned = reply.strip()
+        if reply_cleaned.startswith("```json"):
+            reply_cleaned = reply_cleaned[7:]
+        elif reply_cleaned.startswith("```"):
+            reply_cleaned = reply_cleaned[3:]
+        if reply_cleaned.endswith("```"):
+            reply_cleaned = reply_cleaned[:-3]
+        reply_cleaned = reply_cleaned.strip()
+        
+        action = "UNKNOWN"
+        try:
+            parsed_json = json.loads(reply_cleaned)
+            action = parsed_json.get("action", "UNKNOWN").upper()
+        except json.JSONDecodeError:
+            # Fallback 到旧的正则模式
+            action_match = re.search(r'<ACTION>([A-Z]+)</ACTION>', reply, re.IGNORECASE)
+            action = action_match.group(1).upper() if action_match else "UNKNOWN"
+            
         agent.memory_stream.update_memory(req.symbol, reply)
         
         # 5. 拦截执行逻辑
@@ -389,22 +462,62 @@ async def analyze_and_trade(req: TradeRequest):
                 logger.error(f"❌ 动态头寸计算失败，回退至默认资金。原因: {e}")
                 usdt_balance = 1000.0
 
-            # 严格按照配置分配 5% 仓位
-            POSITION_RISK_PCT = 0.05
-            dynamic_amount = usdt_balance * POSITION_RISK_PCT
+            # 模块化解耦：剥离网关层硬编码的仓位逻辑，下放至专门的 DynamicAllocator
+            # 由于 MCP Server 当前流程中并未完全打通 Oracle 预测和确信度，这里我们使用默认中等确信度进行兜底
+            confidence = 0.8  # 可以后续扩展让 Agent 传回
+            dynamic_amount = dynamic_allocator.calculate_position_size(
+                symbol=req.symbol,
+                confidence=confidence,
+                action=action,
+                current_balance=usdt_balance
+            )
             
             if dynamic_amount < 10.0:
-                logger.warning(f"⚠️ 计算出的头寸 {dynamic_amount:.2f} USDT 低于最小下单金额，跳过本次发单！")
+                logger.warning(f"⚠️ 调度器批复的头寸 {dynamic_amount:.2f} USDT 低于最小发单金额，跳过本次发单！")
                 exec_status = "Skipped (Amount too low)"
             else:
+                ledger_order_id = f"LEDGER_{uuid.uuid4().hex[:10]}"
+                if shadow_ledger_enabled:
+                    sync_res = await shadow_ledger.sync_with_exchange_free(safe_decimal(usdt_balance))
+                    ok, reason = await shadow_ledger.pre_deduct(
+                        order_id=ledger_order_id,
+                        symbol=req.symbol,
+                        amount_usdt=safe_decimal(dynamic_amount),
+                    )
+                    if not ok:
+                        logger.warning(f"🛡️ [ShadowLedger] 预扣失败，拒绝发单: {reason} | sync={sync_res}")
+                        exec_status = f"Skipped (ShadowLedger rejected: {reason})"
+                        return TradeResponse(
+                            symbol=req.symbol,
+                            action="WAIT",
+                            reasoning=reply[:500],
+                            execution_status=exec_status,
+                        )
+
                 logger.info(f"⚔️ 触发执行层: {action} {req.symbol} ${dynamic_amount:.2f} (5% of Balance)")
                 exec_res = await agent.call_mcp_tool_directly(
                     "Execution-MCP", 
                     "execute_smart_order", 
                     {"symbol": req.symbol, "side": action.lower(), "amount_usd": dynamic_amount}
                 )
-                exec_status = json.dumps(exec_res, ensure_ascii=False) if isinstance(exec_res, dict) else str(exec_res)
                 exec_result = exec_res if isinstance(exec_res, dict) else {"status": "unknown", "message": str(exec_res)}
+
+                if shadow_ledger_enabled:
+                    result_status = str(exec_result.get("status") or "").lower()
+                    if result_status in {"success", "success_dry_run", "partial_success"}:
+                        actual_cost = estimate_cost_usdt(
+                            exec_result.get("filled_qty"),
+                            exec_result.get("average_price") or exec_result.get("average"),
+                            exec_result.get("fee"),
+                        )
+                        ledger_result = await shadow_ledger.reconcile(ledger_order_id, actual_cost, "FILLED")
+                    else:
+                        await shadow_ledger.release(ledger_order_id)
+                        ledger_result = {"status": "released", "reason": result_status or "UNKNOWN"}
+
+                    exec_result["shadow_ledger"] = {"order_id": ledger_order_id, "result": ledger_result}
+
+                exec_status = json.dumps(exec_result, ensure_ascii=False)
                 
                 # 推送 Telegram 战报
                 action_emoji = "🟢" if action == "BUY" else "🔴"
@@ -424,6 +537,10 @@ async def analyze_and_trade(req: TradeRequest):
                         f"开仓金额：`${dynamic_amount:.2f}`\n"
                         f"成交均价：{avg_price}\n"
                         f"当前余额：`${usdt_balance:.2f}`\n\n"
+                    )
+                    if exec_result.get("status") == "partial_success":
+                        report_msg += f"⚠️ *注意*：{exec_result.get('message', '主单成功但部分附加操作失败')}\n\n"
+                    report_msg += (
                         f"🧠 *AI 决策核心逻辑*：\n"
                         f"_{reply[:500]}..._"
                     )
@@ -460,4 +577,5 @@ async def analyze_and_trade(req: TradeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run("api_server:app", host="0.0.0.0", port=8002, reload=True)
+    # 关闭 reload，避免日志或缓存文件更新导致服务自动重启
+    uvicorn.run("api_server:app", host="0.0.0.0", port=8002, reload=False)

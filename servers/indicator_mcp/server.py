@@ -18,11 +18,14 @@ load_dotenv(root_dir / ".env", override=True)
 
 from shared.logger import get_logger
 from shared.models import MarketContext, MarketRegime, VolatilityLevel, MCPErrorResponse
-from shared.binance_futures import (
-    BinanceApiError,
-    BinanceNetworkError,
-    build_exchange_from_config,
-)
+
+# 移除对不存在的 shared.binance_futures 的引用，改用 ccxt
+import ccxt.async_support as ccxt
+from ccxt.base.errors import ExchangeError as BinanceApiError, NetworkError as BinanceNetworkError
+
+def build_exchange_from_config(config: dict):
+    return ccxt.binance(config)
+
 from shared.circuit_breaker import get_route_circuit_breaker
 from servers.indicator_mcp.engines.smc_engine import SMCEngine
 from servers.indicator_mcp.engines.hmm_engine import HMMEngine

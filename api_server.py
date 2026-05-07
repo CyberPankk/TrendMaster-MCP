@@ -227,8 +227,8 @@ async def startup_event():
     logger.info("🚀 正在启动 API 网关并连接 MCP 底层服务...")
     await agent.init_mcp_connections()
     
-    # 初始化 SQLite 账本
-    init_db()
+    # 初始化 SQLite 账本（彻底异步化，全部使用 aiosqlite）
+    await init_db()
     
     # 挂载定时任务
     scheduler.add_job(auto_cruise_job, 'interval', minutes=15)

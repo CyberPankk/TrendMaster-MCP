@@ -1,4 +1,4 @@
-import time
+import asyncio
 from cachetools import TTLCache
 from asyncache import cached
 from shared.logger import get_logger
@@ -10,6 +10,7 @@ logger = get_logger("Cache-Manager")
 ohlcv_cache = TTLCache(maxsize=100, ttl=60.0)      # K线缓存 60秒
 market_cache = TTLCache(maxsize=100, ttl=2.0)      # 盘口/成交/Ticker缓存 2秒
 balance_cache = TTLCache(maxsize=1, ttl=10.0)      # 账户余额缓存 10秒
+ohlcv_request_locks: dict[str, asyncio.Lock] = {}
 
 def cache_key_builder(func, *args, **kwargs):
     """
@@ -33,3 +34,37 @@ def cache_key_builder(func, *args, **kwargs):
     
     key = f"{getattr(func, '__name__', 'func')}_{symbol}_{timeframe}_{limit}"
     return key
+
+
+async def get_or_set_ttl_cache(
+    *,
+    cache: TTLCache,
+    key: str,
+    loader,
+    request_locks: dict[str, asyncio.Lock] | None = None,
+    cache_name: str = "ttl_cache",
+):
+    """
+    在 TTLCache 外层补一层按 key 的异步锁，避免并发 miss 时重复打交易所。
+
+    设计原因：
+    - Indicator-MCP 的 OHLCV 拉取既昂贵又容易触发交易所限频；
+    - 同一 symbol/timeframe 在缓存失效瞬间只允许一个协程回源，其他协程复用结果。
+    """
+    if key in cache:
+        return cache[key]
+
+    lock_pool = request_locks if request_locks is not None else {}
+    lock = lock_pool.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        lock_pool[key] = lock
+
+    async with lock:
+        if key in cache:
+            return cache[key]
+
+        logger.info(f"♻️ {cache_name} miss，开始回源加载: {key}")
+        value = await loader()
+        cache[key] = value
+        return value

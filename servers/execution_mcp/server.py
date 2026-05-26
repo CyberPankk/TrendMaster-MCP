@@ -1734,6 +1734,57 @@ async def get_order_info(symbol: str, order_id: str) -> str:
         return MCPErrorResponse(status="error", error_code="FETCH_ORDER_FAILED", message=str(e)).model_dump_json()
 
 @mcp.tool()
+async def cancel_order(symbol: str, order_id: str) -> str:
+    """
+    统一撤销指定订单。
+
+    设计原因：
+    - API Gateway / Patrol Bot 通过 ExecutionGateway 共用同一条撤单链路；
+    - 服务端只负责执行单笔撤单，不在此层重复实现节流，避免与网关治理口径分叉。
+    """
+    try:
+        await engine.init_exchange()
+        normalized_symbol = str(symbol or "").strip()
+        normalized_order_id = str(order_id or "").strip()
+        if not normalized_symbol:
+            return MCPErrorResponse(
+                status="error",
+                error_code="INVALID_PARAMS",
+                message="symbol is required",
+            ).model_dump_json()
+        if not normalized_order_id:
+            return MCPErrorResponse(
+                status="error",
+                error_code="INVALID_PARAMS",
+                message="order_id is required",
+            ).model_dump_json()
+
+        result = await engine.ex.cancel_order(normalized_order_id, normalized_symbol)
+        logger.info(
+            "✅ 撤单成功: symbol=%s order_id=%s",
+            normalized_symbol,
+            normalized_order_id,
+        )
+        return json.dumps(
+            {
+                "status": "success",
+                "symbol": normalized_symbol,
+                "order_id": normalized_order_id,
+                "data": result,
+            },
+            ensure_ascii=False,
+        )
+    except ccxt.OrderNotFound as e:
+        return MCPErrorResponse(status="error", error_code="ORDER_NOT_FOUND", message=str(e)).model_dump_json()
+    except ccxt.AuthenticationError as e:
+        return MCPErrorResponse(status="error", error_code="AUTHENTICATION_ERROR", message=str(e)).model_dump_json()
+    except ccxt.ExchangeError as e:
+        return MCPErrorResponse(status="error", error_code="EXCHANGE_ERROR", message=str(e)).model_dump_json()
+    except Exception as e:
+        logger.error(f"撤单失败: {e}")
+        return MCPErrorResponse(status="error", error_code="CANCEL_ORDER_FAILED", message=str(e)).model_dump_json()
+
+@mcp.tool()
 async def kill_all_positions(symbol: str) -> str:
     """
     [Agent 工具] 一键清仓撤单 (Kill Switch)。撤销所有挂单并市价平掉所有持仓。

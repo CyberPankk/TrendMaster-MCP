@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from anthropic import AsyncAnthropic
 from anthropic.types.message_param import MessageParam
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from colorama import Fore, Style, init
 import sys
@@ -147,6 +148,7 @@ class TrendMasterAgent:
         self.repo_root = os.path.abspath(os.path.join(base_dir, "..", ".."))
         self.system_prompt_path = os.path.join(self.repo_root, "data", "system_prompt.txt")
         self.feed_config_path = os.path.join(self.repo_root, "data", "feed_config.json")
+        self.execution_mcp_endpoint = os.getenv("MCP_ENDPOINT", "http://127.0.0.1:8000").strip()
         self.ensure_system_prompt_file()
         self.ensure_feed_config_file()
         self.mcp_servers = {
@@ -157,6 +159,11 @@ class TrendMasterAgent:
             "FactorLab": os.path.join(base_dir, "servers/factor_lab_mcp/server.py"),
             "Strategy": os.path.join(base_dir, "servers/strategy_mcp/server.py")
         }
+
+    def _normalize_sse_endpoint(self, endpoint: str) -> str:
+        """将 Execution-MCP 端点标准化为 SSE URL，确保 Guardian 与主系统共用同一口径。"""
+        normalized = endpoint.rstrip("/")
+        return normalized if normalized.endswith("/sse") else f"{normalized}/sse"
 
     def ensure_system_prompt_file(self) -> str:
         """确保动态 Prompt 文件存在且可读，首次启动时自动写入默认模板。"""
@@ -368,60 +375,81 @@ class TrendMasterAgent:
             logger.error(f"无法读取技能书 {skill_name}: {e}")
             return safe_fallback
 
+    async def _register_session_tools(self, name: str, session: ClientSession) -> None:
+        """统一注册 MCP Tool，确保 stdio 与 SSE 两种链路对外暴露一致能力。"""
+        tools_response = await session.list_tools()
+        for tool in tools_response.tools:
+            self.tool_routing_map[tool.name] = session
+            anthropic_tool = {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.inputSchema,
+            }
+            self.available_tools.append(anthropic_tool)
+            logger.info(f"  🔧 注册 Tool: {Fore.YELLOW}{tool.name}{Style.RESET_ALL} -> [{name}-MCP]")
+
+        if name == "Market" and "get_ticker" not in self.tool_routing_map:
+            self.tool_routing_map["get_ticker"] = session
+            logger.info(f"  🔧 手动补充注册 Tool: {Fore.YELLOW}get_ticker{Style.RESET_ALL} -> [{name}-MCP]")
+
+    async def _connect_execution_mcp_via_sse(self) -> bool:
+        """
+        优先复用外部 Execution-MCP SSE 端点，避免 Guardian 重复拉起 8000 端口。
+
+        设计原因：
+        - `start_all.sh` 已经单独启动 Execution-MCP 供主 API Gateway 使用；
+        - Guardian 继续通过 stdio 启动同一服务会触发 8000 端口冲突，导致健康状态长期降级。
+        """
+        endpoint = self._normalize_sse_endpoint(self.execution_mcp_endpoint or "http://127.0.0.1:8000")
+        logger.info(f"🔗 优先复用外部 Execution-MCP: {endpoint}")
+        try:
+            sse_cm = sse_client(url=endpoint)
+            read, write = await sse_cm.__aenter__()
+            self.transports.append(sse_cm)
+
+            session = ClientSession(read, write)
+            await session.__aenter__()
+            self.sessions.append(session)
+            await session.initialize()
+            await self._register_session_tools("Execution", session)
+            logger.info(f"{Fore.GREEN}✅ Execution-MCP 已通过外部 SSE 接入{Style.RESET_ALL}")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ 复用外部 Execution-MCP 失败，将回退本地 stdio 启动: {e}")
+            return False
+
     async def init_mcp_connections(self):
-        """同时启动并连接多个 MCP Server，手动管理生命周期"""
+        """同时启动并连接多个 MCP Server，优先复用外部 Execution-MCP，避免重复绑端口。"""
         logger.info(f"{Fore.CYAN}正在唤醒 MCP 微服务集群...{Style.RESET_ALL}")
-        
+
         for name, script_path in self.mcp_servers.items():
+            if name == "Execution" and self.execution_mcp_endpoint:
+                reused = await self._connect_execution_mcp_via_sse()
+                if reused:
+                    continue
+
             if not os.path.exists(script_path):
                 logger.error(f"找不到 {script_path}，请检查路径！")
                 continue
-                
+
             server_params = StdioServerParameters(
-                command=sys.executable, # 使用当前虚拟环境的 python
+                command=sys.executable,  # 使用当前虚拟环境的 python
                 args=[script_path],
-                # 必须继承当前环境变量，否则子进程拿不到 API Keys
-                env=os.environ.copy() 
+                env=os.environ.copy(),  # 必须继承当前环境变量，否则子进程拿不到 API Keys
             )
-            
+
             try:
-                # 1. 启动并管理 stdio_client
-                # ⚠️ 修复：直接获取 stdio_client 的 context manager，并在其中包装 session
-                # 这样可以确保 anyio 的 task group 不会在多个 task 之间乱窜
                 stdio_cm = stdio_client(server_params)
                 read, write = await stdio_cm.__aenter__()
-                self.transports.append(stdio_cm) # 记录下来以便 cleanup 时 __aexit__
-                
-                # 2. 启动并管理 ClientSession
+                self.transports.append(stdio_cm)
+
                 session = ClientSession(read, write)
                 await session.__aenter__()
                 self.sessions.append(session)
-                
-                # 3. 初始化连接
                 await session.initialize()
-                
-                # 4. 获取该 Server 的 Tools 并注册到路由表
-                tools_response = await session.list_tools()
-                
-                for tool in tools_response.tools:
-                    self.tool_routing_map[tool.name] = session
-                    
-                    # 将 MCP Tool 格式转换为 Anthropic JSON Schema 格式
-                    anthropic_tool = {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.inputSchema
-                    }
-                    self.available_tools.append(anthropic_tool)
-                    logger.info(f"  🔧 注册 Tool: {Fore.YELLOW}{tool.name}{Style.RESET_ALL} -> [{name}-MCP]")
-                    
-                # 手动注入可能由于网络原因未在启动时声明，但服务端已包含的 Tool (容错机制)
-                if name == "Market" and "get_ticker" not in self.tool_routing_map:
-                    self.tool_routing_map["get_ticker"] = session
-                    logger.info(f"  🔧 手动补充注册 Tool: {Fore.YELLOW}get_ticker{Style.RESET_ALL} -> [{name}-MCP]")
-                    
+                await self._register_session_tools(name, session)
                 logger.info(f"{Fore.GREEN}✅ {name}-MCP 准备就绪{Style.RESET_ALL}")
-                
+
             except Exception as e:
                 logger.error(f"连接 {name}-MCP 失败: {e}")
 

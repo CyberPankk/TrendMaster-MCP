@@ -30,6 +30,7 @@
   - `HMM Engine`: 隐马尔可夫模型，精准识别市场波动率与牛熊震荡状态。
   - `SMC Engine`: 聪明钱概念，向量化识别 FVG（公允价值缺口）与 BOS（结构突破）。
   - `Orderflow Engine`: 订单流引擎，结合 OFI 与主动成交（Aggressor Trades）洞察主力资金真实意图。
+  - `Kronos Forecast`: 本地时间序列预测入口，启动阶段预热本地模型；不可用时自动降级为启发式预测，并通过 Fat-Tool 注入 `kronos_forecast` 与共振风控。
 - 🛡️ **Execution-MCP (执行层)**：绝对安全的物理沙盒。内建硬编码风控，若大模型指令触发最大滑点或仓位上限，拥有“一票否决权”。
 
 ### 📂 目录结构 (Directory Structure)
@@ -57,6 +58,7 @@ pip install -r requirements.txt
 
 2. 配置秘钥:
 复制 .env.example 为 .env，填入你的 LLM API Key (支持 DeepSeek/Claude/OpenAI) 及交易所 API Key。
+如需启用本地 Kronos，补齐 `KRONOS_LOCAL_REPO_PATH`、`KRONOS_MODEL_ID`、`KRONOS_TOKENIZER_ID` 与 `KRONOS_DEVICE`；配置不完整时系统会保守降级，不影响 Indicator-MCP 启动。
 
 3. 启动系统:
 python agent_client.py

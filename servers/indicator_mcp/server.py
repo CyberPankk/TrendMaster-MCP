@@ -1766,19 +1766,16 @@ async def get_full_market_context(symbol: str, timeframe: str = "1h") -> str:
         # OFI & Aggressor
         ofi_score = orderflow_engine.calculate_ofi(symbol, orderbook)
         aggressor_data = orderflow_engine.analyze_aggressor_trades(trades) # 计算真实成交
-        kronos_runtime_status = getattr(get_local_kronos_runtime, "_status", {}) or {}
-        kronos_prediction = validate_kronos_payload(
-            build_kronos_heuristic_forecast(
-                symbol=symbol,
-                timeframe=timeframe,
-                df=df,
-                pred_len=int(os.getenv("KRONOS_DEFAULT_PRED_LEN", "24")),
-                runtime_status=kronos_runtime_status,
-            ),
-            current_price,
+        kronos_prediction = await build_kronos_prediction(
+            symbol=symbol,
+            timeframe=timeframe,
+            df=df,
+            pred_len=int(os.getenv("KRONOS_DEFAULT_PRED_LEN", "24")),
+            current_price=current_price,
         )
         kronos_prediction.setdefault("meta", {})
-        kronos_prediction["meta"]["prefetch_mode"] = "fat_tool_fast_path"
+        kronos_prediction["meta"]["prefetch_mode"] = "fat_tool_unified_prediction"
+        kronos_prediction["meta"]["market_data_source"] = market_data_source
         risk_guardrail = build_kronos_guardrail(kronos_prediction, hmm_res, smc_res)
         
         # ==========================================

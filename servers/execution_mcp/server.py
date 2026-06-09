@@ -219,6 +219,161 @@ class ExecutionEngine:
             logger.error("API Key or Secret not found in environment variables!")
             # 可以在这里抛出异常或在 init_exchange 时处理
 
+    def _build_symbol_candidates(self, symbol: str) -> list[str]:
+        """
+        生成同一合约在 CCXT/Binance Futures 下的候选 symbol 列表。
+
+        设计原因：
+        - Web 端大多使用 `BTC/USDT`，但 Binance U 本位持仓在 CCXT 中经常表现为 `BTC/USDT:USDT`；
+        - ROI 回撤风控触发 kill switch 时，如果 execution_mcp 只按单一格式查询，
+          会出现“调用成功但未命中真实持仓”的假成功。
+        """
+        normalized_symbol = str(symbol or "").strip()
+        if not normalized_symbol:
+            return []
+
+        candidates: list[str] = [normalized_symbol]
+        if ":" in normalized_symbol:
+            base_symbol = normalized_symbol.split(":", maxsplit=1)[0].strip()
+            if base_symbol and base_symbol not in candidates:
+                candidates.append(base_symbol)
+        elif normalized_symbol.endswith("/USDT"):
+            futures_symbol = f"{normalized_symbol}:USDT"
+            if futures_symbol not in candidates:
+                candidates.append(futures_symbol)
+
+        return candidates
+
+    def _normalize_symbol_identity(self, symbol: str) -> str:
+        """
+        将不同表现形式的 symbol 归一到同一比较键。
+
+        设计原因：
+        - `BTC/USDT` 与 `BTC/USDT:USDT` 本质指向同一条 USDT 永续；
+        - kill switch、保护单更新与持仓查询必须共享统一的符号匹配口径，
+          否则会在高波动阶段出现风控命中但执行层查不到仓位的问题。
+        """
+        normalized_symbol = str(symbol or "").strip()
+        if not normalized_symbol:
+            return ""
+        normalized_symbol = normalized_symbol.split(":", maxsplit=1)[0]
+        return (
+            normalized_symbol.replace("/", "")
+            .replace("-", "")
+            .replace("_", "")
+            .upper()
+        )
+
+    def _symbol_matches(self, left: str, right: str) -> bool:
+        """
+        判断两个 symbol 是否指向同一条合约。
+        """
+        left_key = self._normalize_symbol_identity(left)
+        right_key = self._normalize_symbol_identity(right)
+        return bool(left_key and right_key and left_key == right_key)
+
+    async def _fetch_positions_for_symbol(self, symbol: str) -> tuple[list[dict], str]:
+        """
+        按 symbol 获取匹配持仓，并在必要时退化到全量扫描。
+
+        设计原因：
+        - Binance Futures 的 symbol 过滤在不同 CCXT 版本下表现并不稳定；
+        - 当风控需要立即平仓时，必须支持 `fetch_positions(None)` 全量扫描，
+          避免因为 `BTC/USDT` / `BTC/USDT:USDT` 口径差异漏掉真实仓位。
+        """
+        await self.init_exchange()
+        candidates = self._build_symbol_candidates(symbol)
+        matched_positions: list[dict] = []
+
+        for candidate in candidates:
+            try:
+                positions = await self.ex.fetch_positions([candidate])
+            except Exception as exc:
+                logger.warning("按候选 symbol 查询持仓失败: requested=%s candidate=%s error=%s", symbol, candidate, exc)
+                continue
+
+            for pos in positions or []:
+                pos_symbol = str(pos.get("symbol") or candidate)
+                if self._symbol_matches(pos_symbol, symbol):
+                    matched_positions.append(pos)
+
+            if matched_positions:
+                resolved_symbol = str(matched_positions[0].get("symbol") or candidate)
+                if resolved_symbol != symbol:
+                    logger.info("持仓 symbol 解析映射: requested=%s resolved=%s", symbol, resolved_symbol)
+                return matched_positions, resolved_symbol
+
+        try:
+            positions = await self.ex.fetch_positions(None)
+        except Exception as exc:
+            logger.warning("全量扫描持仓失败: requested=%s error=%s", symbol, exc)
+            fallback_symbol = candidates[0] if candidates else str(symbol or "").strip()
+            return [], fallback_symbol
+
+        for pos in positions or []:
+            pos_symbol = str(pos.get("symbol") or "")
+            if self._symbol_matches(pos_symbol, symbol):
+                matched_positions.append(pos)
+
+        resolved_symbol = (
+            str(matched_positions[0].get("symbol"))
+            if matched_positions
+            else (candidates[0] if candidates else str(symbol or "").strip())
+        )
+        if matched_positions and resolved_symbol != symbol:
+            logger.info("全量扫描命中持仓 symbol 映射: requested=%s resolved=%s", symbol, resolved_symbol)
+        return matched_positions, resolved_symbol
+
+    async def _fetch_open_orders_for_symbol(self, symbol: str) -> tuple[list[dict], str]:
+        """
+        按 symbol 获取匹配挂单，并在必要时退化到全量扫描。
+
+        设计原因：
+        - 风控平仓前必须先撤保护单，否则 ReduceOnly 数量可能被旧条件单占用；
+        - 如果挂单查询也受 symbol 口径影响，就会让 kill switch 在 -2022 场景下持续失效。
+        """
+        await self.init_exchange()
+        candidates = self._build_symbol_candidates(symbol)
+
+        for candidate in candidates:
+            try:
+                orders = await self.ex.fetch_open_orders(candidate)
+            except Exception as exc:
+                logger.warning("按候选 symbol 查询挂单失败: requested=%s candidate=%s error=%s", symbol, candidate, exc)
+                continue
+
+            matched_orders = [
+                order
+                for order in (orders or [])
+                if self._symbol_matches(str(order.get("symbol") or candidate), symbol)
+            ]
+            if matched_orders:
+                resolved_symbol = str(matched_orders[0].get("symbol") or candidate)
+                if resolved_symbol != symbol:
+                    logger.info("挂单 symbol 解析映射: requested=%s resolved=%s", symbol, resolved_symbol)
+                return matched_orders, resolved_symbol
+
+        try:
+            orders = await self.ex.fetch_open_orders()
+        except Exception as exc:
+            logger.warning("全量扫描挂单失败: requested=%s error=%s", symbol, exc)
+            fallback_symbol = candidates[0] if candidates else str(symbol or "").strip()
+            return [], fallback_symbol
+
+        matched_orders = [
+            order
+            for order in (orders or [])
+            if self._symbol_matches(str(order.get("symbol") or ""), symbol)
+        ]
+        resolved_symbol = (
+            str(matched_orders[0].get("symbol"))
+            if matched_orders
+            else (candidates[0] if candidates else str(symbol or "").strip())
+        )
+        if matched_orders and resolved_symbol != symbol:
+            logger.info("全量扫描命中挂单 symbol 映射: requested=%s resolved=%s", symbol, resolved_symbol)
+        return matched_orders, resolved_symbol
+
     async def _cancel_twap_task(self, task_id: str, reason: str) -> None:
         """
         取消指定 TWAP 任务（用于反向信号/清仓等场景，避免后台切片继续对打与消耗手续费）。
@@ -253,11 +408,7 @@ class ExecutionEngine:
         """
         判断交易所当前是否已经存在本系统创建的止损单，避免重试过程重复创建。
         """
-        await self.init_exchange()
-        try:
-            open_orders = await self.ex.fetch_open_orders(symbol)
-        except Exception:
-            return False
+        open_orders, _ = await self._fetch_open_orders_for_symbol(symbol)
 
         for o in open_orders or []:
             otype = str(o.get("type") or "").lower()
@@ -434,11 +585,7 @@ class ExecutionEngine:
                 return
 
     async def _has_managed_take_profit(self, symbol: str, tag_prefix: str) -> bool:
-        await self.init_exchange()
-        try:
-            open_orders = await self.ex.fetch_open_orders(symbol)
-        except Exception:
-            return False
+        open_orders, _ = await self._fetch_open_orders_for_symbol(symbol)
         for o in open_orders or []:
             otype = str(o.get("type") or "").lower()
             info = o.get("info") if isinstance(o.get("info"), dict) else {}
@@ -802,7 +949,7 @@ class ExecutionEngine:
             # 动态敞口上限：默认基础限额，如果账户盈利且总权益增厚，允许放宽至总权益的 2 倍（2x 杠杆敞口）
             dynamic_max_position = max(RISK_CONFIG["MAX_POSITION_USD"], total_equity * Decimal("2.0"))
             
-            positions = await self.ex.fetch_positions([symbol])
+            positions, _ = await self._fetch_positions_for_symbol(symbol)
             current_long_notional = Decimal("0")
             current_short_notional = Decimal("0")
             
@@ -873,26 +1020,266 @@ class ExecutionEngine:
         return self._extract_usdt_balance(balance)
     
     async def cancel_all_orders(self, symbol: str):
+        """
+        取消指定 symbol 的全部挂单，并自动适配 Binance Futures 的 symbol 变体。
+        """
         await self.init_exchange()
-        await self.ex.cancel_all_orders(symbol)
+        open_orders, resolved_symbol = await self._fetch_open_orders_for_symbol(symbol)
+        target_symbols = [resolved_symbol]
+        for candidate in self._build_symbol_candidates(symbol):
+            if candidate not in target_symbols:
+                target_symbols.append(candidate)
+
+        last_exc: Exception | None = None
+        for candidate in target_symbols:
+            try:
+                await self.ex.cancel_all_orders(candidate)
+                if candidate != symbol:
+                    logger.info("撤单 symbol 解析映射: requested=%s resolved=%s", symbol, candidate)
+                return
+            except Exception as exc:
+                last_exc = exc
+
+        if open_orders and last_exc is not None:
+            raise last_exc
+
+    def _extract_position_side_param(self, position: dict) -> str | None:
+        """
+        提取 Binance 对冲模式需要的 positionSide 参数。
+        """
+        raw_info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        raw_position_side = str(
+            raw_info.get("positionSide")
+            or position.get("positionSide")
+            or position.get("position_side")
+            or ""
+        ).upper()
+        if raw_position_side in {"LONG", "SHORT"}:
+            return raw_position_side
+
+        side = str(position.get("side") or "").lower()
+        if side == "long":
+            return "LONG"
+        if side == "short":
+            return "SHORT"
+        return None
+
+    def _is_reduce_only_not_required_error(self, message: str) -> bool:
+        """
+        判断交易所是否返回了“reduceOnly 参数不需要”的语义错误。
+
+        设计原因：
+        - Binance 某些平仓路径下会返回 -1106，表示当前请求场景无需显式传 reduceOnly；
+        - 如果直接把该错误当成失败，会导致 kill switch 在明明可平仓的情况下被误判为异常。
+        """
+        normalized = str(message or "").lower()
+        return (
+            "-1106" in normalized
+            and "reduceonly" in normalized
+            and "not required" in normalized
+        )
+
+    def _is_reduce_only_rejected_error(self, message: str) -> bool:
+        """
+        判断交易所是否返回了 ReduceOnly 被拒绝的错误。
+
+        设计原因：
+        - -2022 常见于旧保护单占用数量、对冲模式参数不完整等场景；
+        - 将识别逻辑单独抽出，便于主平仓流程和后续重试逻辑共用。
+        """
+        normalized = str(message or "").lower()
+        return "-2022" in normalized or "reduceonly order is rejected" in normalized
+
+    async def _submit_market_close_order(
+        self,
+        symbol: str,
+        close_side: str,
+        amount_str: str,
+        position_side: str | None,
+        allow_reduce_only_retry: bool = True,
+    ) -> tuple[dict, str]:
+        """
+        提交市价平仓单，并在交易所返回 -1106 时自动去掉 reduceOnly 重试。
+
+        设计原因：
+        - kill switch 的目标是优先清仓，而不是执着于固定参数组合；
+        - 只有识别到交易所明确声明“reduceOnly 不需要”时，才执行一次无 reduceOnly 重试，
+          避免把其他真正的交易所错误误判成可恢复异常。
+        """
+        primary_params: dict[str, object] = {"reduceOnly": True}
+        if position_side:
+            primary_params["positionSide"] = position_side
+
+        try:
+            order = await self.ex.create_market_order(
+                symbol,
+                close_side,
+                float(amount_str),
+                params=primary_params,
+            )
+            return order, "reduce_only"
+        except Exception as exc:
+            message = str(exc)
+            if not allow_reduce_only_retry or not self._is_reduce_only_not_required_error(message):
+                raise
+
+            retry_params = {
+                "positionSide": position_side,
+            } if position_side else {}
+            logger.warning(
+                "⚠️ %s 平仓遇到 -1106 reduceOnly not required，自动改为无 reduceOnly 重试。"
+                " close_side=%s amount=%s position_side=%s",
+                symbol,
+                close_side,
+                amount_str,
+                position_side or "NONE",
+            )
+            order = await self.ex.create_market_order(
+                symbol,
+                close_side,
+                float(amount_str),
+                params=retry_params,
+            )
+            return order, "no_reduce_only_retry"
+
+    async def _cancel_protection_orders(self, symbol: str) -> int:
+        """
+        只清理保护性质的条件单，避免 ReduceOnly 数量被旧保护单占用。
+        """
+        open_orders, resolved_symbol = await self._fetch_open_orders_for_symbol(symbol)
+
+        cancelled = 0
+        for order in open_orders or []:
+            info = order.get("info") if isinstance(order.get("info"), dict) else {}
+            order_type = str(order.get("type") or info.get("type") or "").upper()
+            client_id = _extract_client_order_id(order) or ""
+            reduce_only_flag = str(
+                order.get("reduceOnly")
+                or info.get("reduceOnly")
+                or info.get("closePosition")
+                or ""
+            ).lower() in {"true", "1"}
+            is_protection_order = (
+                reduce_only_flag
+                or order_type in {"STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
+                or client_id.startswith("TM_SL_")
+                or client_id.startswith("TM_TP_")
+            )
+            if not is_protection_order:
+                continue
+
+            order_id = order.get("id")
+            if not order_id:
+                continue
+            try:
+                await self.ex.cancel_order(order_id, resolved_symbol)
+                cancelled += 1
+            except Exception as exc:
+                logger.warning(f"取消保护单失败 {resolved_symbol} order_id={order_id}: {exc}")
+        return cancelled
+
+    async def _close_position_with_fallback(self, symbol: str, position: dict) -> dict:
+        """
+        对单个仓位执行带兜底的平仓逻辑。
+
+        设计原因：
+        - Binance 在存在残余保护单或账户处于对冲模式时，ReduceOnly 市价单可能返回 -2022；
+        - 当出现该错误时，先确保撤掉保护单，再带 positionSide 重试一次，避免风控触发后仓位滞留；
+        - 另外兼容 -1106 reduceOnly not required，在交易所明确声明无需该参数时自动无 reduceOnly 重试。
+        """
+        size = safe_decimal(position.get("contracts", 0))
+        if size <= Decimal("0"):
+            return {"status": "skipped", "message": f"{symbol} 无需平仓"}
+
+        side = str(position.get("side") or "").lower()
+        close_side = "sell" if side == "long" else "buy"
+        amount_str = self.ex.amount_to_precision(symbol, float(size))
+        position_side = self._extract_position_side_param(position)
+
+        try:
+            order, submit_mode = await self._submit_market_close_order(
+                symbol=symbol,
+                close_side=close_side,
+                amount_str=amount_str,
+                position_side=position_side,
+            )
+            return {
+                "status": "success",
+                "mode": submit_mode,
+                "order_id": order.get("id"),
+                "amount": amount_str,
+                "close_side": close_side,
+                "reduce_only_applied": submit_mode == "reduce_only",
+            }
+        except Exception as exc:
+            message = str(exc)
+            if not self._is_reduce_only_rejected_error(message):
+                raise
+
+            logger.warning(
+                f"⚠️ {symbol} ReduceOnly 平仓被拒绝，尝试执行保护单清理 + positionSide 兜底重试: {message}"
+            )
+            await self._cancel_protection_orders(symbol)
+            await asyncio.sleep(0.2)
+
+            refreshed_positions, resolved_symbol = await self._fetch_positions_for_symbol(symbol)
+            refreshed_position = None
+            for pos in refreshed_positions or []:
+                if self._symbol_matches(str(pos.get("symbol") or ""), resolved_symbol) and safe_decimal(pos.get("contracts", 0)) > Decimal("0"):
+                    refreshed_position = pos
+                    break
+
+            if not refreshed_position:
+                return {
+                    "status": "success",
+                    "mode": "post_reject_refresh",
+                    "message": f"{symbol} 在 -2022 后刷新持仓时已无仓位，视为已清空。",
+                }
+
+            fallback_position_side = self._extract_position_side_param(refreshed_position)
+            refreshed_size = safe_decimal(refreshed_position.get("contracts", 0))
+            execution_symbol = str(refreshed_position.get("symbol") or resolved_symbol or symbol)
+            refreshed_amount_str = self.ex.amount_to_precision(execution_symbol, float(refreshed_size))
+            fallback_side = str(refreshed_position.get("side") or "").lower()
+            fallback_close_side = "sell" if fallback_side == "long" else "buy"
+            order, submit_mode = await self._submit_market_close_order(
+                symbol=execution_symbol,
+                close_side=fallback_close_side,
+                amount_str=refreshed_amount_str,
+                position_side=fallback_position_side,
+            )
+            return {
+                "status": "success",
+                "mode": (
+                    "position_side_fallback"
+                    if submit_mode == "reduce_only"
+                    else "position_side_no_reduce_only_fallback"
+                ),
+                "order_id": order.get("id"),
+                "amount": refreshed_amount_str,
+                "close_side": fallback_close_side,
+                "reduce_only_applied": submit_mode == "reduce_only",
+            }
 
     async def close_all_positions(self, symbol: str):
         """
         市价平掉指定 symbol 的所有持仓
         """
         await self.init_exchange()
-        positions = await self.ex.fetch_positions([symbol])
+        try:
+            await self.cancel_all_orders(symbol)
+        except Exception as exc:
+            logger.warning(f"取消 {symbol} 全部挂单失败，继续执行持仓清理: {exc}")
+        await self._cancel_protection_orders(symbol)
+        positions, resolved_symbol = await self._fetch_positions_for_symbol(symbol)
         
         closed_count = 0
         for position in positions:
             size = safe_decimal(position.get('contracts', 0))
-            side = position['side'] # 'long' or 'short'
-            
             if size > Decimal("0"):
-                # 平仓方向相反
-                close_side = 'sell' if side == 'long' else 'buy'
-                amount_str = self.ex.amount_to_precision(symbol, float(size))
-                await self.ex.create_market_order(symbol, close_side, float(amount_str), params={'reduceOnly': True})
+                execution_symbol = str(position.get("symbol") or resolved_symbol or symbol)
+                close_result = await self._close_position_with_fallback(execution_symbol, position)
+                logger.info(f"✅ {execution_symbol} 平仓结果: {close_result}")
                 closed_count += 1
                 
         return closed_count
@@ -908,7 +1295,7 @@ class ExecutionEngine:
         :return: 更新的止损单详情列表
         """
         await self.init_exchange()
-        positions = await self.ex.fetch_positions([symbol])
+        positions, resolved_symbol = await self._fetch_positions_for_symbol(symbol)
         updated_sl_orders = []
         
         for pos in positions:
@@ -916,6 +1303,7 @@ class ExecutionEngine:
             if size <= Decimal("0"):
                 continue
                 
+            execution_symbol = str(pos.get("symbol") or resolved_symbol or symbol)
             side = pos.get('side', '').lower()
             mark_price = safe_decimal(pos.get('markPrice', 0))
             entry_price = safe_decimal(pos.get('entryPrice', pos.get('entry_price', 0)))
@@ -944,7 +1332,7 @@ class ExecutionEngine:
             # 只有在有浮盈，且盈利率达到了激活阈值 (ROE >= roe_activation) 且价格有效的情况下，才启动或上调追踪止损
             if unrealized_pnl > Decimal("0") and effective_roe >= safe_decimal(roe_activation) and mark_price > Decimal("0") and entry_price > Decimal("0"):
                 trailing_dec = safe_decimal(trailing_pct)
-                amount_str = self.ex.amount_to_precision(symbol, float(size))
+                amount_str = self.ex.amount_to_precision(execution_symbol, float(size))
                 
                 new_sl_price = Decimal("0")
                 close_side = 'sell'
@@ -967,28 +1355,28 @@ class ExecutionEngine:
                     close_side = 'buy'
                 
                 if new_sl_price > Decimal("0"):
-                    price_str = self.ex.price_to_precision(symbol, float(new_sl_price))
+                    price_str = self.ex.price_to_precision(execution_symbol, float(new_sl_price))
                     
                     if RISK_CONFIG["DRY_RUN_MODE"]:
-                        logger.info(f"🛡️ [DRY-RUN] 模拟挂出混合驱动追踪止损单: {close_side} {symbol} {amount_str} @ 触发价 {price_str} (当前综合ROE {effective_roe:.2%})")
-                        updated_sl_orders.append({"symbol": symbol, "side": close_side, "amount": amount_str, "sl_price": price_str, "mode": "dry_run", "system_roe": float(system_roe), "binance_roe": float(binance_roe)})
+                        logger.info(f"🛡️ [DRY-RUN] 模拟挂出混合驱动追踪止损单: {close_side} {execution_symbol} {amount_str} @ 触发价 {price_str} (当前综合ROE {effective_roe:.2%})")
+                        updated_sl_orders.append({"symbol": execution_symbol, "side": close_side, "amount": amount_str, "sl_price": price_str, "mode": "dry_run", "system_roe": float(system_roe), "binance_roe": float(binance_roe)})
                     else:
                         try:
                             # 真实环境：撤销现有的所有条件单，重新挂载
-                            await self.ex.cancel_all_orders(symbol)
+                            await self.cancel_all_orders(execution_symbol)
                             
                             # 根据交易所类型，发送止损单。以下为币安 U本位合约的通用 Stop Market 单
                             sl_params = {
                                 'stopPrice': float(price_str),
                                 'reduceOnly': True
                             }
-                            order = await self.ex.create_order(symbol, 'STOP_MARKET', close_side, float(amount_str), None, sl_params)
+                            order = await self.ex.create_order(execution_symbol, 'STOP_MARKET', close_side, float(amount_str), None, sl_params)
                             
                             # 将 ROE 数据一并返回给调用方（如 Agent 或网关）
                             order['system_roe'] = float(system_roe)
                             order['binance_roe'] = float(binance_roe)
                             
-                            logger.info(f"✅ 成功更新混合追踪止损单: {close_side} {symbol} {amount_str} @ 触发价 {price_str} (当前综合ROE {effective_roe:.2%})")
+                            logger.info(f"✅ 成功更新混合追踪止损单: {close_side} {execution_symbol} {amount_str} @ 触发价 {price_str} (当前综合ROE {effective_roe:.2%})")
                             updated_sl_orders.append(order)
                         except Exception as e:
                             logger.error(f"❌ 更新混合追踪止损单失败: {e}")
@@ -1120,22 +1508,11 @@ async def get_active_twap_tasks(symbol: str = "") -> str:
 async def get_position_snapshot(symbol: str) -> str:
     try:
         await engine.init_exchange()
-        symbols_to_try = [symbol]
-        if ":" not in symbol and symbol.endswith("/USDT"):
-            symbols_to_try.append(f"{symbol}:USDT")
-
+        positions, resolved_symbol = await engine._fetch_positions_for_symbol(symbol)
         position = None
-        for sym in symbols_to_try:
-            try:
-                positions = await engine.ex.fetch_positions([sym])
-            except Exception:
-                continue
-            for pos in positions or []:
-                if (pos.get("symbol") or "") == sym:
-                    position = pos
-                    symbol = sym
-                    break
-            if position:
+        for pos in positions or []:
+            if safe_decimal(pos.get("contracts", 0)) > Decimal("0"):
+                position = pos
                 break
 
         if not position:
@@ -1159,7 +1536,7 @@ async def get_position_snapshot(symbol: str) -> str:
             roe = price_move_pct * leverage
 
         data = {
-            "symbol": symbol,
+            "symbol": str(position.get("symbol") or resolved_symbol or symbol),
             "contracts": float(contracts),
             "side": side,
             "entry_price": float(entry_price),
@@ -1173,6 +1550,62 @@ async def get_position_snapshot(symbol: str) -> str:
     except Exception as e:
         logger.exception("获取持仓快照失败")
         return MCPErrorResponse(status="error", error_code="POSITION_QUERY_FAILED", message=str(e)).model_dump_json()
+
+@mcp.tool()
+async def get_protection_snapshot(symbol: str) -> str:
+    """
+    查询当前 symbol 是否存在本系统管理的 reduceOnly 止损保护单。
+    """
+    try:
+        await engine.init_exchange()
+        open_orders, resolved_symbol = await engine._fetch_open_orders_for_symbol(symbol)
+        tag_prefix = f"TM_SL_{_normalize_client_tag_symbol(resolved_symbol or symbol)}"
+        protection_orders: list[dict] = []
+
+        for order in open_orders or []:
+            otype = str(order.get("type") or "").lower()
+            info = order.get("info") if isinstance(order.get("info"), dict) else {}
+            has_stop = ("stop" in otype) or ("stopPrice" in info) or ("stopprice" in {k.lower() for k in info.keys()})
+            if not has_stop:
+                continue
+
+            reduce_only = False
+            if isinstance(info, dict):
+                reduce_only = str(info.get("reduceOnly") or info.get("reduce_only") or "").lower() in {"true", "1"}
+
+            client_id = _extract_client_order_id(order)
+            is_managed = bool(client_id and client_id.startswith(tag_prefix))
+            if reduce_only and is_managed:
+                protection_orders.append(
+                    {
+                        "id": order.get("id"),
+                        "client_order_id": client_id,
+                        "type": order.get("type"),
+                        "side": order.get("side"),
+                        "amount": order.get("amount"),
+                        "stop_price": (
+                            order.get("stopPrice")
+                            or (info.get("stopPrice") if isinstance(info, dict) else None)
+                            or (info.get("stopPrice".lower()) if isinstance(info, dict) else None)
+                        ),
+                    }
+                )
+
+        return json.dumps(
+            {
+                "status": "success",
+                "data": {
+                    "symbol": str(resolved_symbol or symbol),
+                    "tag_prefix": tag_prefix,
+                    "has_stop_loss": len(protection_orders) > 0,
+                    "protection_orders": protection_orders,
+                },
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        logger.exception("获取保护单快照失败")
+        return MCPErrorResponse(status="error", error_code="PROTECTION_QUERY_FAILED", message=str(e)).model_dump_json()
 
 @mcp.tool()
 async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_type: str = 'market', price: float = None, sl_price: float = None, tp_price: float = None, volatility: float = 0.0) -> str:
@@ -1545,18 +1978,19 @@ async def update_stop_loss(symbol: str, position_side: str, sl_price: float) -> 
                 ensure_ascii=False,
             )
 
-        positions = await engine.ex.fetch_positions([symbol])
+        positions, resolved_symbol = await engine._fetch_positions_for_symbol(symbol)
         position = None
         for pos in positions or []:
-            if (pos.get("symbol") or "") == symbol and safe_decimal(pos.get("contracts", 0)) > Decimal("0"):
+            if safe_decimal(pos.get("contracts", 0)) > Decimal("0"):
                 position = pos
                 break
 
         if not position:
             return MCPErrorResponse(status="rejected", error_code="NO_POSITION", message=f"{symbol} 当前无持仓，无法更新止损单").model_dump_json()
 
+        execution_symbol = str(position.get("symbol") or resolved_symbol or symbol)
         contracts = safe_decimal(position.get("contracts", 0))
-        amount_str = engine.ex.amount_to_precision(symbol, float(contracts))
+        amount_str = engine.ex.amount_to_precision(execution_symbol, float(contracts))
         close_side = None
 
         raw_side = (position.get("side") or "").lower()
@@ -1570,12 +2004,12 @@ async def update_stop_loss(symbol: str, position_side: str, sl_price: float) -> 
         if sl_price_dec <= Decimal("0"):
             return MCPErrorResponse(status="error", error_code="INVALID_PARAMS", message="sl_price 必须大于 0").model_dump_json()
 
-        sl_price_str = engine.ex.price_to_precision(symbol, float(sl_price_dec))
-        tag_prefix = f"TM_SL_{_normalize_client_tag_symbol(symbol)}"
+        sl_price_str = engine.ex.price_to_precision(execution_symbol, float(sl_price_dec))
+        tag_prefix = f"TM_SL_{_normalize_client_tag_symbol(execution_symbol)}"
 
         new_client_id = f"{tag_prefix}_{int(time.time() * 1000)}"
         sl_order = await engine.ex.create_order(
-            symbol=symbol,
+            symbol=execution_symbol,
             type="STOP_MARKET",
             side=close_side,
             amount=float(amount_str),
@@ -1585,9 +2019,10 @@ async def update_stop_loss(symbol: str, position_side: str, sl_price: float) -> 
 
         cancelled_order_ids: list[str] = []
         try:
-            open_orders = await engine.ex.fetch_open_orders(symbol)
+            open_orders, resolved_open_symbol = await engine._fetch_open_orders_for_symbol(execution_symbol)
         except Exception:
             open_orders = []
+            resolved_open_symbol = execution_symbol
 
         for o in open_orders or []:
             oid = o.get("id")
@@ -1603,7 +2038,7 @@ async def update_stop_loss(symbol: str, position_side: str, sl_price: float) -> 
             is_managed = bool(client_id and client_id.startswith(tag_prefix))
             if has_stop and reduce_only and is_managed and oid:
                 try:
-                    await engine.ex.cancel_order(oid, symbol)
+                    await engine.ex.cancel_order(oid, resolved_open_symbol)
                     cancelled_order_ids.append(str(oid))
                 except Exception:
                     pass
@@ -1611,12 +2046,13 @@ async def update_stop_loss(symbol: str, position_side: str, sl_price: float) -> 
         return json.dumps(
             {
                 "status": "success",
-                "message": f"止损单已更新: {symbol} -> {sl_price_str}",
+                "message": f"止损单已更新: {execution_symbol} -> {sl_price_str}",
                 "cancelled_order_ids": cancelled_order_ids,
                 "sl_order_id": new_order_id,
                 "sl_price": sl_price_str,
                 "amount": amount_str,
                 "close_side": close_side,
+                "symbol": execution_symbol,
             },
             ensure_ascii=False,
         )
@@ -1638,18 +2074,19 @@ async def update_take_profit(symbol: str, position_side: str, tp_price: float) -
                 ensure_ascii=False,
             )
 
-        positions = await engine.ex.fetch_positions([symbol])
+        positions, resolved_symbol = await engine._fetch_positions_for_symbol(symbol)
         position = None
         for pos in positions or []:
-            if (pos.get("symbol") or "") == symbol and safe_decimal(pos.get("contracts", 0)) > Decimal("0"):
+            if safe_decimal(pos.get("contracts", 0)) > Decimal("0"):
                 position = pos
                 break
 
         if not position:
             return MCPErrorResponse(status="rejected", error_code="NO_POSITION", message=f"{symbol} 当前无持仓，无法更新止盈单").model_dump_json()
 
+        execution_symbol = str(position.get("symbol") or resolved_symbol or symbol)
         contracts = safe_decimal(position.get("contracts", 0))
-        amount_str = engine.ex.amount_to_precision(symbol, float(contracts))
+        amount_str = engine.ex.amount_to_precision(execution_symbol, float(contracts))
 
         raw_side = (position.get("side") or "").lower()
         if raw_side in {"long", "short"}:
@@ -1662,12 +2099,12 @@ async def update_take_profit(symbol: str, position_side: str, tp_price: float) -
         if tp_price_dec <= Decimal("0"):
             return MCPErrorResponse(status="error", error_code="INVALID_PARAMS", message="tp_price 必须大于 0").model_dump_json()
 
-        tp_price_str = engine.ex.price_to_precision(symbol, float(tp_price_dec))
-        tag_prefix = f"TM_TP_{_normalize_client_tag_symbol(symbol)}"
+        tp_price_str = engine.ex.price_to_precision(execution_symbol, float(tp_price_dec))
+        tag_prefix = f"TM_TP_{_normalize_client_tag_symbol(execution_symbol)}"
 
         new_client_id = f"{tag_prefix}_{int(time.time() * 1000)}"
         tp_order = await engine.ex.create_order(
-            symbol=symbol,
+            symbol=execution_symbol,
             type="TAKE_PROFIT_MARKET",
             side=close_side,
             amount=float(amount_str),
@@ -1677,9 +2114,10 @@ async def update_take_profit(symbol: str, position_side: str, tp_price: float) -
 
         cancelled_order_ids: list[str] = []
         try:
-            open_orders = await engine.ex.fetch_open_orders(symbol)
+            open_orders, resolved_open_symbol = await engine._fetch_open_orders_for_symbol(execution_symbol)
         except Exception:
             open_orders = []
+            resolved_open_symbol = execution_symbol
 
         for o in open_orders or []:
             oid = o.get("id")
@@ -1695,7 +2133,7 @@ async def update_take_profit(symbol: str, position_side: str, tp_price: float) -
             is_managed = bool(client_id and client_id.startswith(tag_prefix))
             if has_tp and reduce_only and is_managed and oid:
                 try:
-                    await engine.ex.cancel_order(oid, symbol)
+                    await engine.ex.cancel_order(oid, resolved_open_symbol)
                     cancelled_order_ids.append(str(oid))
                 except Exception:
                     pass
@@ -1703,12 +2141,13 @@ async def update_take_profit(symbol: str, position_side: str, tp_price: float) -
         return json.dumps(
             {
                 "status": "success",
-                "message": f"止盈单已更新: {symbol} -> {tp_price_str}",
+                "message": f"止盈单已更新: {execution_symbol} -> {tp_price_str}",
                 "cancelled_order_ids": cancelled_order_ids,
                 "tp_order_id": new_order_id,
                 "tp_price": tp_price_str,
                 "amount": amount_str,
                 "close_side": close_side,
+                "symbol": execution_symbol,
             },
             ensure_ascii=False,
         )
@@ -1806,8 +2245,51 @@ async def kill_all_positions(symbol: str) -> str:
         # 2. 平掉所有仓位
         closed_count = await engine.close_all_positions(symbol)
         logger.info(f"已平仓 {symbol} 的 {closed_count} 个持仓。")
-        
-        return json.dumps({"status": "success", "message": f"Kill switch executed for {symbol}. Orders cancelled, {closed_count} positions closed."}, ensure_ascii=False)
+
+        # 再次复查交易所持仓，避免 symbol 口径异常或交易所拒单时出现“假成功”。
+        remaining_positions, resolved_symbol = await engine._fetch_positions_for_symbol(symbol)
+        live_positions = [
+            pos
+            for pos in (remaining_positions or [])
+            if safe_decimal(pos.get("contracts", 0)) > Decimal("0")
+        ]
+        if live_positions:
+            logger.error(
+                "❌ Kill switch 执行后仍有持仓残留: requested=%s resolved=%s remaining=%s",
+                symbol,
+                resolved_symbol,
+                [
+                    {
+                        "symbol": str(pos.get("symbol") or resolved_symbol or symbol),
+                        "contracts": str(pos.get("contracts", 0)),
+                        "side": pos.get("side"),
+                    }
+                    for pos in live_positions
+                ],
+            )
+            return MCPErrorResponse(
+                status="error",
+                error_code="KILL_SWITCH_POSITION_REMAINING",
+                message=(
+                    f"Kill switch 执行后 {symbol} 仍检测到未平仓持仓，"
+                    f"resolved_symbol={resolved_symbol}"
+                ),
+            ).model_dump_json()
+
+        result_message = (
+            f"Kill switch executed for {symbol}. Orders cancelled, {closed_count} positions closed."
+            if closed_count > 0
+            else f"Kill switch executed for {symbol}. No live positions remained after verification."
+        )
+        return json.dumps(
+            {
+                "status": "success",
+                "message": result_message,
+                "closed_count": closed_count,
+                "resolved_symbol": resolved_symbol,
+            },
+            ensure_ascii=False,
+        )
 
     except Exception as e:
         logger.error(f"熔断失败: {str(e)}")

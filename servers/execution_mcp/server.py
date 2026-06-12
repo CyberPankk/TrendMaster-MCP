@@ -289,7 +289,7 @@ class ExecutionEngine:
             try:
                 positions = await self.ex.fetch_positions([candidate])
             except Exception as exc:
-                logger.warning("按候选 symbol 查询持仓失败: requested=%s candidate=%s error=%s", symbol, candidate, exc)
+                logger.warning(f"按候选 symbol 查询持仓失败: requested={symbol} candidate={candidate} error={exc}")
                 continue
 
             for pos in positions or []:
@@ -300,13 +300,13 @@ class ExecutionEngine:
             if matched_positions:
                 resolved_symbol = str(matched_positions[0].get("symbol") or candidate)
                 if resolved_symbol != symbol:
-                    logger.info("持仓 symbol 解析映射: requested=%s resolved=%s", symbol, resolved_symbol)
+                    logger.info(f"持仓 symbol 解析映射: requested={symbol} resolved={resolved_symbol}")
                 return matched_positions, resolved_symbol
 
         try:
             positions = await self.ex.fetch_positions(None)
         except Exception as exc:
-            logger.warning("全量扫描持仓失败: requested=%s error=%s", symbol, exc)
+            logger.warning(f"全量扫描持仓失败: requested={symbol} error={exc}")
             fallback_symbol = candidates[0] if candidates else str(symbol or "").strip()
             return [], fallback_symbol
 
@@ -321,7 +321,7 @@ class ExecutionEngine:
             else (candidates[0] if candidates else str(symbol or "").strip())
         )
         if matched_positions and resolved_symbol != symbol:
-            logger.info("全量扫描命中持仓 symbol 映射: requested=%s resolved=%s", symbol, resolved_symbol)
+            logger.info(f"全量扫描命中持仓 symbol 映射: requested={symbol} resolved={resolved_symbol}")
         return matched_positions, resolved_symbol
 
     async def _fetch_open_orders_for_symbol(self, symbol: str) -> tuple[list[dict], str]:
@@ -339,7 +339,7 @@ class ExecutionEngine:
             try:
                 orders = await self.ex.fetch_open_orders(candidate)
             except Exception as exc:
-                logger.warning("按候选 symbol 查询挂单失败: requested=%s candidate=%s error=%s", symbol, candidate, exc)
+                logger.warning(f"按候选 symbol 查询挂单失败: requested={symbol} candidate={candidate} error={exc}")
                 continue
 
             matched_orders = [
@@ -350,13 +350,13 @@ class ExecutionEngine:
             if matched_orders:
                 resolved_symbol = str(matched_orders[0].get("symbol") or candidate)
                 if resolved_symbol != symbol:
-                    logger.info("挂单 symbol 解析映射: requested=%s resolved=%s", symbol, resolved_symbol)
+                    logger.info(f"挂单 symbol 解析映射: requested={symbol} resolved={resolved_symbol}")
                 return matched_orders, resolved_symbol
 
         try:
             orders = await self.ex.fetch_open_orders()
         except Exception as exc:
-            logger.warning("全量扫描挂单失败: requested=%s error=%s", symbol, exc)
+            logger.warning(f"全量扫描挂单失败: requested={symbol} error={exc}")
             fallback_symbol = candidates[0] if candidates else str(symbol or "").strip()
             return [], fallback_symbol
 
@@ -371,7 +371,7 @@ class ExecutionEngine:
             else (candidates[0] if candidates else str(symbol or "").strip())
         )
         if matched_orders and resolved_symbol != symbol:
-            logger.info("全量扫描命中挂单 symbol 映射: requested=%s resolved=%s", symbol, resolved_symbol)
+            logger.info(f"全量扫描命中挂单 symbol 映射: requested={symbol} resolved={resolved_symbol}")
         return matched_orders, resolved_symbol
 
     async def _cancel_twap_task(self, task_id: str, reason: str) -> None:
@@ -1035,7 +1035,7 @@ class ExecutionEngine:
             try:
                 await self.ex.cancel_all_orders(candidate)
                 if candidate != symbol:
-                    logger.info("撤单 symbol 解析映射: requested=%s resolved=%s", symbol, candidate)
+                    logger.info(f"撤单 symbol 解析映射: requested={symbol} resolved={candidate}")
                 return
             except Exception as exc:
                 last_exc = exc
@@ -1550,6 +1550,54 @@ async def get_position_snapshot(symbol: str) -> str:
     except Exception as e:
         logger.exception("获取持仓快照失败")
         return MCPErrorResponse(status="error", error_code="POSITION_QUERY_FAILED", message=str(e)).model_dump_json()
+
+@mcp.tool()
+async def get_all_position_snapshots() -> str:
+    """
+    查询账户当前所有真实持仓快照，供 API 风控做全仓硬止损巡检。
+    """
+    try:
+        await engine.init_exchange()
+        positions = await engine.ex.fetch_positions(None)
+        snapshots: list[dict] = []
+
+        for position in positions or []:
+            contracts = safe_decimal(position.get("contracts", 0))
+            if contracts <= Decimal("0"):
+                continue
+
+            entry_price = safe_decimal(position.get("entryPrice", position.get("entry_price", 0)))
+            mark_price = safe_decimal(position.get("markPrice", position.get("mark_price", 0)))
+            unrealized_pnl = safe_decimal(position.get("unrealizedPnl", position.get("unrealized_pnl", 0)))
+            side = position.get("side") or position.get("positionSide") or position.get("position_side")
+            leverage = float(position.get("leverage", 20))
+            initial_margin = safe_decimal(position.get("initialMargin", position.get("initial_margin", 0)))
+
+            roe = 0.0
+            if initial_margin > 0:
+                roe = float(unrealized_pnl / initial_margin)
+            elif entry_price > 0 and contracts > 0:
+                price_diff = mark_price - entry_price if side == "long" else entry_price - mark_price
+                price_move_pct = float(price_diff / entry_price)
+                roe = price_move_pct * leverage
+
+            snapshots.append(
+                {
+                    "symbol": str(position.get("symbol") or ""),
+                    "contracts": float(contracts),
+                    "side": side,
+                    "entry_price": float(entry_price),
+                    "mark_price": float(mark_price),
+                    "unrealized_pnl": float(unrealized_pnl),
+                    "leverage": leverage,
+                    "roe": roe,
+                }
+            )
+
+        return json.dumps({"status": "success", "data": snapshots}, ensure_ascii=False)
+    except Exception as e:
+        logger.exception("获取全仓持仓快照失败")
+        return MCPErrorResponse(status="error", error_code="ALL_POSITION_QUERY_FAILED", message=str(e)).model_dump_json()
 
 @mcp.tool()
 async def get_protection_snapshot(symbol: str) -> str:

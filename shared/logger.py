@@ -45,25 +45,34 @@ class QuantLogger:
             self.logger.addHandler(console_handler)
             self.logger.addHandler(file_handler)
 
-    def info(self, msg: str):
+    def _format(self, msg: object, *args: object) -> str:
+        text = str(msg)
+        if not args:
+            return text
+        try:
+            return text % args
+        except Exception:
+            return " ".join([text, *(str(arg) for arg in args)])
+
+    def info(self, msg: object, *args: object, **kwargs: object):
         """记录 INFO 级别的日志"""
-        self.logger.info(f"{Fore.GREEN}INFO{Style.RESET_ALL}: {msg}")
+        self.logger.info(f"{Fore.GREEN}INFO{Style.RESET_ALL}: {self._format(msg, *args)}", **kwargs)
 
-    def warn(self, msg: str):
+    def warn(self, msg: object, *args: object, **kwargs: object):
         """记录 WARN 级别的日志"""
-        self.logger.warning(f"{Fore.MAGENTA}WARN{Style.RESET_ALL}: {msg}")
+        self.logger.warning(f"{Fore.MAGENTA}WARN{Style.RESET_ALL}: {self._format(msg, *args)}", **kwargs)
 
-    def warning(self, msg: str):
+    def warning(self, msg: object, *args: object, **kwargs: object):
         """兼容 python 标准库的 warning 命名"""
-        self.warn(msg)
+        self.warn(msg, *args, **kwargs)
 
-    def error(self, msg: str):
+    def error(self, msg: object, *args: object, **kwargs: object):
         """记录 ERROR 级别的日志"""
-        self.logger.error(f"{Fore.RED}ERROR{Style.RESET_ALL}: {msg}")
+        self.logger.error(f"{Fore.RED}ERROR{Style.RESET_ALL}: {self._format(msg, *args)}", **kwargs)
 
-    def exception(self, msg: str):
+    def exception(self, msg: object, *args: object, **kwargs: object):
         """兼容 python 标准库的 exception 命名，保留完整异常栈。"""
-        self.logger.exception(f"{Fore.RED}ERROR{Style.RESET_ALL}: {msg}")
+        self.logger.exception(f"{Fore.RED}ERROR{Style.RESET_ALL}: {self._format(msg, *args)}", **kwargs)
 
 # 导出工具方法
 def get_logger(service_name: str) -> QuantLogger:

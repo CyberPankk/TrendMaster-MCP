@@ -1085,12 +1085,13 @@ class ExecutionEngine:
         allow_reduce_only_retry: bool = True,
     ) -> tuple[dict, str]:
         """
-        提交市价平仓单，并在交易所返回 -1106 时自动去掉 reduceOnly 重试。
+        提交市价平仓单，并在交易所返回 -1106 时自动降级重试。
 
         设计原因：
         - kill switch 的目标是优先清仓，而不是执着于固定参数组合；
-        - 只有识别到交易所明确声明“reduceOnly 不需要”时，才执行一次无 reduceOnly 重试，
+        - 只有识别到交易所明确声明“reduceOnly 不需要”时，才执行无 reduceOnly 重试，
           避免把其他真正的交易所错误误判成可恢复异常。
+        - 降级重试先使用最小参数集，兼容 Binance 单向持仓模式；仍失败时再按对冲模式补 positionSide。
         """
         order_timeout = float(os.getenv("KILL_SWITCH_ORDER_TIMEOUT_SEC", "12") or 12)
         primary_params: dict[str, object] = {"reduceOnly": True}
@@ -1117,31 +1118,53 @@ class ExecutionEngine:
             if not allow_reduce_only_retry or not self._is_reduce_only_not_required_error(message):
                 raise
 
-            retry_params = {
-                "positionSide": position_side,
-            } if position_side else {}
             logger.warning(
-                "⚠️ %s 平仓遇到 -1106 reduceOnly not required，自动改为无 reduceOnly 重试。"
+                "⚠️ %s 平仓遇到 -1106 reduceOnly not required，自动进入无 reduceOnly 降级重试。"
                 " close_side=%s amount=%s position_side=%s",
                 symbol,
                 close_side,
                 amount_str,
                 position_side or "NONE",
             )
-            order = await asyncio.wait_for(
-                self.ex.create_market_order(
-                    symbol,
-                    close_side,
-                    float(amount_str),
-                    params=retry_params,
-                ),
-                timeout=order_timeout,
-            )
-            logger.info(
-                f"✅ {symbol} 无 reduceOnly 市价平仓重试已提交: side={close_side} amount={amount_str} "
-                f"position_side={position_side or 'NONE'} order_id={order.get('id')}"
-            )
-            return order, "no_reduce_only_retry"
+
+            retry_variants: list[tuple[str, dict[str, object]]] = [("no_reduce_only_minimal_retry", {})]
+            if position_side:
+                retry_variants.append(("no_reduce_only_position_side_retry", {"positionSide": position_side}))
+
+            last_exc: Exception | None = None
+            for retry_mode, retry_params in retry_variants:
+                try:
+                    order = await asyncio.wait_for(
+                        self.ex.create_market_order(
+                            symbol,
+                            close_side,
+                            float(amount_str),
+                            params=retry_params,
+                        ),
+                        timeout=order_timeout,
+                    )
+                    logger.info(
+                        f"✅ {symbol} 无 reduceOnly 市价平仓重试已提交: mode={retry_mode} "
+                        f"side={close_side} amount={amount_str} position_side={position_side or 'NONE'} "
+                        f"order_id={order.get('id')}"
+                    )
+                    return order, retry_mode
+                except Exception as retry_exc:
+                    last_exc = retry_exc
+                    logger.warning(
+                        "⚠️ %s 无 reduceOnly 平仓重试失败: mode=%s close_side=%s amount=%s "
+                        "position_side=%s error=%s",
+                        symbol,
+                        retry_mode,
+                        close_side,
+                        amount_str,
+                        position_side or "NONE",
+                        retry_exc,
+                    )
+
+            if last_exc:
+                raise last_exc
+            raise
 
     async def _cancel_protection_orders(self, symbol: str) -> int:
         """
@@ -2365,14 +2388,10 @@ async def kill_all_positions_global() -> str:
         except Exception as e:
             logger.error(f"获取全局持仓失败: {e}")
 
-        try:
-            open_orders = await engine.ex.fetch_open_orders()
-            for o in open_orders or []:
-                sym = o.get("symbol")
-                if sym:
-                    symbols.add(sym)
-        except Exception as e:
-            logger.error(f"获取全局挂单失败: {e}")
+        logger.warning(
+            "跳过无 symbol 全局挂单扫描以避免 Binance Futures 356 秒限频；"
+            "将仅基于真实持仓 symbol 执行撤单和平仓。"
+        )
 
         cancelled = 0
         closed = 0

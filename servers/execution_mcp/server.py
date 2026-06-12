@@ -353,26 +353,12 @@ class ExecutionEngine:
                     logger.info(f"挂单 symbol 解析映射: requested={symbol} resolved={resolved_symbol}")
                 return matched_orders, resolved_symbol
 
-        try:
-            orders = await self.ex.fetch_open_orders()
-        except Exception as exc:
-            logger.warning(f"全量扫描挂单失败: requested={symbol} error={exc}")
-            fallback_symbol = candidates[0] if candidates else str(symbol or "").strip()
-            return [], fallback_symbol
-
-        matched_orders = [
-            order
-            for order in (orders or [])
-            if self._symbol_matches(str(order.get("symbol") or ""), symbol)
-        ]
-        resolved_symbol = (
-            str(matched_orders[0].get("symbol"))
-            if matched_orders
-            else (candidates[0] if candidates else str(symbol or "").strip())
+        fallback_symbol = candidates[0] if candidates else str(symbol or "").strip()
+        logger.warning(
+            "未按候选 symbol 查询到挂单，跳过无 symbol 全量扫描以避免 Binance Futures 356 秒限频: "
+            f"requested={symbol} fallback={fallback_symbol}"
         )
-        if matched_orders and resolved_symbol != symbol:
-            logger.info(f"全量扫描命中挂单 symbol 映射: requested={symbol} resolved={resolved_symbol}")
-        return matched_orders, resolved_symbol
+        return [], fallback_symbol
 
     async def _cancel_twap_task(self, task_id: str, reason: str) -> None:
         """
@@ -1106,16 +1092,24 @@ class ExecutionEngine:
         - 只有识别到交易所明确声明“reduceOnly 不需要”时，才执行一次无 reduceOnly 重试，
           避免把其他真正的交易所错误误判成可恢复异常。
         """
+        order_timeout = float(os.getenv("KILL_SWITCH_ORDER_TIMEOUT_SEC", "12") or 12)
         primary_params: dict[str, object] = {"reduceOnly": True}
         if position_side:
             primary_params["positionSide"] = position_side
 
         try:
-            order = await self.ex.create_market_order(
-                symbol,
-                close_side,
-                float(amount_str),
-                params=primary_params,
+            order = await asyncio.wait_for(
+                self.ex.create_market_order(
+                    symbol,
+                    close_side,
+                    float(amount_str),
+                    params=primary_params,
+                ),
+                timeout=order_timeout,
+            )
+            logger.info(
+                f"✅ {symbol} reduceOnly 市价平仓已提交: side={close_side} amount={amount_str} "
+                f"position_side={position_side or 'NONE'} order_id={order.get('id')}"
             )
             return order, "reduce_only"
         except Exception as exc:
@@ -1134,11 +1128,18 @@ class ExecutionEngine:
                 amount_str,
                 position_side or "NONE",
             )
-            order = await self.ex.create_market_order(
-                symbol,
-                close_side,
-                float(amount_str),
-                params=retry_params,
+            order = await asyncio.wait_for(
+                self.ex.create_market_order(
+                    symbol,
+                    close_side,
+                    float(amount_str),
+                    params=retry_params,
+                ),
+                timeout=order_timeout,
+            )
+            logger.info(
+                f"✅ {symbol} 无 reduceOnly 市价平仓重试已提交: side={close_side} amount={amount_str} "
+                f"position_side={position_side or 'NONE'} order_id={order.get('id')}"
             )
             return order, "no_reduce_only_retry"
 

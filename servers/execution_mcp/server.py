@@ -1,12 +1,16 @@
 # Execution Engine: Powered by ccxt.async_support
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import sys
 import sqlite3
+import urllib.parse
 from pathlib import Path
 from dotenv import load_dotenv
+import aiohttp
 import ccxt.async_support as ccxt
 from decimal import Decimal
 
@@ -859,6 +863,86 @@ class ExecutionEngine:
             
         return ex
 
+    def _binance_usdm_rest_base_url(self) -> str:
+        if os.getenv("USE_TESTNET", "False").lower() in ("true", "1", "yes"):
+            return "https://testnet.binancefuture.com"
+        return "https://fapi.binance.com"
+
+    def _binance_symbol_id(self, symbol: str) -> str:
+        try:
+            market = self.ex.market(symbol) if self.ex else None
+            market_id = market.get("id") if isinstance(market, dict) else None
+            if market_id:
+                return str(market_id)
+        except Exception:
+            pass
+        return (
+            str(symbol or "")
+            .replace(":USDT", "")
+            .replace("/", "")
+            .replace("-", "")
+            .upper()
+        )
+
+    async def _submit_binance_usdm_market_order_direct(
+        self,
+        symbol: str,
+        close_side: str,
+        amount_str: str,
+        params: dict[str, object],
+        timeout_sec: float,
+    ) -> dict:
+        """
+        Binance U 本位合约 kill switch 专用 REST 下单通道。
+
+        ccxt 异步下单在极端网络/连接状态下可能拖住 SSE 调用；kill switch 需要更短、
+        更可控的超时边界，因此这里直接签名请求 Binance Futures REST。
+        """
+        if not self.api_key or not self.secret:
+            raise ValueError("Missing API credentials")
+
+        payload: dict[str, object] = {
+            "symbol": self._binance_symbol_id(symbol),
+            "side": close_side.upper(),
+            "type": "MARKET",
+            "quantity": amount_str,
+            "recvWindow": int(os.getenv("BINANCE_RECV_WINDOW_MS", "5000") or 5000),
+            "timestamp": int(time.time() * 1000),
+        }
+        payload.update({k: v for k, v in (params or {}).items() if v is not None})
+        if "reduceOnly" in payload:
+            payload["reduceOnly"] = "true" if bool(payload["reduceOnly"]) else "false"
+
+        query = urllib.parse.urlencode(payload)
+        signature = hmac.new(self.secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+        body = f"{query}&signature={signature}"
+        url = f"{self._binance_usdm_rest_base_url()}/fapi/v1/order"
+        proxy_url = os.getenv("CCXT_PROXY") or None
+        headers = {
+            "X-MBX-APIKEY": self.api_key,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.post(url, data=body, headers=headers, proxy=proxy_url) as response:
+                response_text = await response.text()
+                try:
+                    data = json.loads(response_text)
+                except Exception:
+                    data = {"raw": response_text}
+                if response.status >= 400:
+                    code = data.get("code") if isinstance(data, dict) else None
+                    message = data.get("msg") if isinstance(data, dict) else response_text
+                    raise RuntimeError(
+                        f"Binance direct market close failed: status={response.status} "
+                        f"code={code} msg={message}"
+                    )
+                if isinstance(data, dict):
+                    data.setdefault("id", data.get("orderId"))
+                    data.setdefault("clientOrderId", data.get("clientOrderId"))
+                return data if isinstance(data, dict) else {"raw": data}
+
     async def init_exchange(self):
         if not self.ex:
             logger.info("⏳ [Execution Gateway] 正在后台线程执行沉重的引擎初始化...")
@@ -1097,6 +1181,74 @@ class ExecutionEngine:
         primary_params: dict[str, object] = {"reduceOnly": True}
         if position_side:
             primary_params["positionSide"] = position_side
+
+        use_direct_binance_rest = (
+            self.exchange_id == "binanceusdm"
+            and os.getenv("KILL_SWITCH_USE_DIRECT_BINANCE_REST", "true").lower() not in {"0", "false", "no"}
+        )
+
+        if use_direct_binance_rest:
+            try:
+                order = await self._submit_binance_usdm_market_order_direct(
+                    symbol=symbol,
+                    close_side=close_side,
+                    amount_str=amount_str,
+                    params=primary_params,
+                    timeout_sec=order_timeout,
+                )
+                logger.info(
+                    f"✅ {symbol} Binance REST reduceOnly 市价平仓已提交: side={close_side} "
+                    f"amount={amount_str} position_side={position_side or 'NONE'} order_id={order.get('id')}"
+                )
+                return order, "binance_rest_reduce_only"
+            except Exception as exc:
+                message = str(exc)
+                if not allow_reduce_only_retry or not self._is_reduce_only_not_required_error(message):
+                    raise
+
+                logger.warning(
+                    "⚠️ %s Binance REST 平仓遇到 -1106 reduceOnly not required，进入无 reduceOnly 降级重试。"
+                    " close_side=%s amount=%s position_side=%s",
+                    symbol,
+                    close_side,
+                    amount_str,
+                    position_side or "NONE",
+                )
+                retry_variants: list[tuple[str, dict[str, object]]] = [("binance_rest_minimal_retry", {})]
+                if position_side:
+                    retry_variants.append(("binance_rest_position_side_retry", {"positionSide": position_side}))
+
+                last_exc: Exception | None = None
+                for retry_mode, retry_params in retry_variants:
+                    try:
+                        order = await self._submit_binance_usdm_market_order_direct(
+                            symbol=symbol,
+                            close_side=close_side,
+                            amount_str=amount_str,
+                            params=retry_params,
+                            timeout_sec=order_timeout,
+                        )
+                        logger.info(
+                            f"✅ {symbol} Binance REST 无 reduceOnly 市价平仓已提交: mode={retry_mode} "
+                            f"side={close_side} amount={amount_str} position_side={position_side or 'NONE'} "
+                            f"order_id={order.get('id')}"
+                        )
+                        return order, retry_mode
+                    except Exception as retry_exc:
+                        last_exc = retry_exc
+                        logger.warning(
+                            "⚠️ %s Binance REST 无 reduceOnly 平仓重试失败: mode=%s close_side=%s amount=%s "
+                            "position_side=%s error=%s",
+                            symbol,
+                            retry_mode,
+                            close_side,
+                            amount_str,
+                            position_side or "NONE",
+                            retry_exc,
+                        )
+                if last_exc:
+                    raise last_exc
+                raise
 
         try:
             order = await asyncio.wait_for(

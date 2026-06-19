@@ -219,6 +219,48 @@ class ExecutionEngine:
             logger.error("API Key or Secret not found in environment variables!")
             # 可以在这里抛出异常或在 init_exchange 时处理
 
+    def _extract_position_direction(self, position: dict) -> str:
+        """
+        统一提取持仓方向，兼容 Binance 对冲模式下 side=None 的持仓结构。
+        """
+        if not isinstance(position, dict):
+            return ""
+
+        raw_side = str(position.get("side") or "").strip().lower()
+        if raw_side in {"long", "short"}:
+            return raw_side
+
+        raw_info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        raw_position_side = str(
+            position.get("positionSide")
+            or position.get("position_side")
+            or raw_info.get("positionSide")
+            or raw_info.get("position_side")
+            or ""
+        ).strip().upper()
+        if raw_position_side == "LONG":
+            return "long"
+        if raw_position_side == "SHORT":
+            return "short"
+        return ""
+
+    def _resolve_close_side_for_protection(self, position: dict, position_side: str) -> str | None:
+        """
+        为止损/止盈保护单推导平仓方向，方向未知时返回 None 以避免误挂反向单。
+        """
+        direction = self._extract_position_direction(position)
+        if direction == "long":
+            return "sell"
+        if direction == "short":
+            return "buy"
+
+        raw_position_side = str(position_side or "").strip().upper()
+        if raw_position_side in {"BUY", "LONG"}:
+            return "sell"
+        if raw_position_side in {"SELL", "SHORT"}:
+            return "buy"
+        return None
+
     async def _cancel_twap_task(self, task_id: str, reason: str) -> None:
         """
         取消指定 TWAP 任务（用于反向信号/清仓等场景，避免后台切片继续对打与消耗手续费）。
@@ -809,7 +851,7 @@ class ExecutionEngine:
             for pos in positions:
                 size = safe_decimal(pos.get('contracts', 0))
                 mark_price = safe_decimal(pos.get('markPrice', 0))
-                pos_side = pos.get('side', '').lower()
+                pos_side = self._extract_position_direction(pos)
                 
                 if size > Decimal("0") and mark_price > Decimal("0"):
                     notional = size * mark_price
@@ -916,7 +958,7 @@ class ExecutionEngine:
             if size <= Decimal("0"):
                 continue
                 
-            side = pos.get('side', '').lower()
+            side = self._extract_position_direction(pos)
             mark_price = safe_decimal(pos.get('markPrice', 0))
             entry_price = safe_decimal(pos.get('entryPrice', pos.get('entry_price', 0)))
             unrealized_pnl = safe_decimal(pos.get('unrealizedPnl', 0))
@@ -1146,15 +1188,16 @@ async def get_position_snapshot(symbol: str) -> str:
         mark_price = safe_decimal(position.get("markPrice", position.get("mark_price", 0)))
         unrealized_pnl = safe_decimal(position.get("unrealizedPnl", position.get("unrealized_pnl", 0)))
         side = position.get("side") or position.get("positionSide") or position.get("position_side")
+        normalized_side = engine._extract_position_direction(position)
         leverage = float(position.get("leverage", 20))
         initial_margin = safe_decimal(position.get("initialMargin", position.get("initial_margin", 0)))
         
         roe = 0.0
         if initial_margin > 0:
             roe = float(unrealized_pnl / initial_margin)
-        elif entry_price > 0 and contracts > 0:
+        elif entry_price > 0 and contracts > 0 and normalized_side in {"long", "short"}:
             # 兼容：如果拿不到 margin，根据杠杆推算 ROE
-            price_diff = mark_price - entry_price if side == "long" else entry_price - mark_price
+            price_diff = mark_price - entry_price if normalized_side == "long" else entry_price - mark_price
             price_move_pct = float(price_diff / entry_price)
             roe = price_move_pct * leverage
 
@@ -1557,14 +1600,13 @@ async def update_stop_loss(symbol: str, position_side: str, sl_price: float) -> 
 
         contracts = safe_decimal(position.get("contracts", 0))
         amount_str = engine.ex.amount_to_precision(symbol, float(contracts))
-        close_side = None
-
-        raw_side = (position.get("side") or "").lower()
-        if raw_side in {"long", "short"}:
-            close_side = "sell" if raw_side == "long" else "buy"
-        else:
-            ps = str(position_side or "").upper()
-            close_side = "sell" if ps == "BUY" else "buy"
+        close_side = engine._resolve_close_side_for_protection(position, position_side)
+        if not close_side:
+            return MCPErrorResponse(
+                status="error",
+                error_code="INVALID_POSITION_DIRECTION",
+                message=f"{symbol} 无法识别持仓方向，拒绝更新止损单",
+            ).model_dump_json()
 
         sl_price_dec = safe_decimal(sl_price)
         if sl_price_dec <= Decimal("0"):
@@ -1650,13 +1692,13 @@ async def update_take_profit(symbol: str, position_side: str, tp_price: float) -
 
         contracts = safe_decimal(position.get("contracts", 0))
         amount_str = engine.ex.amount_to_precision(symbol, float(contracts))
-
-        raw_side = (position.get("side") or "").lower()
-        if raw_side in {"long", "short"}:
-            close_side = "sell" if raw_side == "long" else "buy"
-        else:
-            ps = str(position_side or "").upper()
-            close_side = "sell" if ps == "BUY" else "buy"
+        close_side = engine._resolve_close_side_for_protection(position, position_side)
+        if not close_side:
+            return MCPErrorResponse(
+                status="error",
+                error_code="INVALID_POSITION_DIRECTION",
+                message=f"{symbol} 无法识别持仓方向，拒绝更新止盈单",
+            ).model_dump_json()
 
         tp_price_dec = safe_decimal(tp_price)
         if tp_price_dec <= Decimal("0"):

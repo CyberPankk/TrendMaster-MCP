@@ -193,19 +193,43 @@ def _extract_client_order_id(order: dict) -> str | None:
             return str(val)
     return None
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"true", "1", "yes", "on"}
+
+
+USE_TESTNET_MODE = _env_flag("USE_TESTNET", True)
+LIVE_TRADING_ENABLED = _env_flag("LIVE_TRADING_ENABLED", False)
+
+
+def _production_live_order_requires_permission() -> bool:
+    return not RISK_CONFIG["DRY_RUN_MODE"] and not USE_TESTNET_MODE
+
+
+def _production_live_order_allowed() -> bool:
+    return (not _production_live_order_requires_permission()) or LIVE_TRADING_ENABLED
+
+
 # --- 动态加载风控阈值与安全开关 ---
 RISK_CONFIG = {
     "MAX_ORDER_USD": Decimal(os.getenv("MAX_ORDER_USD", "5000")),
     "MAX_POSITION_USD": Decimal(os.getenv("MAX_POSITION_USD", "20000")),
     "MAX_SPREAD_PCT": Decimal(os.getenv("MAX_SPREAD_PCT", "0.005")),
     "VOLATILITY_THRESHOLD": Decimal("0.02"), # 波动率阈值 (2%)，超过则禁止市价单
-    "DRY_RUN_MODE": os.getenv("DRY_RUN_MODE", "False").lower() in ("true", "1", "yes")
+    "DRY_RUN_MODE": _env_flag("DRY_RUN_MODE", True),
+    "RISK_CHECK_FAIL_OPEN": _env_flag("RISK_CHECK_FAIL_OPEN", False),
 }
 
 if RISK_CONFIG["DRY_RUN_MODE"]:
     logger.warning("⚠️ 当前处于 模拟盘(DRY RUN) 模式")
+elif USE_TESTNET_MODE:
+    logger.warning("🧪 当前处于 Binance 测试网模式，允许测试网物理下单")
+elif LIVE_TRADING_ENABLED:
+    logger.warning("🔥 当前处于 实盘(LIVE) 模式，LIVE_TRADING_ENABLED 已显式开启")
 else:
-    logger.info("🔥 当前处于 实盘(LIVE) 模式")
+    logger.error("🛑 当前配置指向生产实盘，但 LIVE_TRADING_ENABLED 未开启，真实下单将被拒绝")
 
 class ExecutionEngine:
     def __init__(self, exchange_id='binanceusdm'):
@@ -275,6 +299,31 @@ class ExecutionEngine:
         left_key = self._normalize_symbol_identity(left)
         right_key = self._normalize_symbol_identity(right)
         return bool(left_key and right_key and left_key == right_key)
+
+    def _extract_position_direction(self, position: dict) -> str:
+        """
+        统一提取持仓方向，兼容 CCXT 在对冲模式下返回 side=None 的情况。
+        """
+        if not isinstance(position, dict):
+            return ""
+
+        raw_side = str(position.get("side") or "").strip().lower()
+        if raw_side in {"long", "short"}:
+            return raw_side
+
+        raw_info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        raw_position_side = str(
+            position.get("positionSide")
+            or position.get("position_side")
+            or raw_info.get("positionSide")
+            or raw_info.get("position_side")
+            or ""
+        ).strip().upper()
+        if raw_position_side == "LONG":
+            return "long"
+        if raw_position_side == "SHORT":
+            return "short"
+        return ""
 
     async def _fetch_positions_for_symbol(self, symbol: str) -> tuple[list[dict], str]:
         """
@@ -858,13 +907,13 @@ class ExecutionEngine:
         ex = getattr(ccxt.async_support, self.exchange_id)(exchange_config)
         
         # 如果是 Testnet，开启沙盒模式
-        if os.getenv("USE_TESTNET", "False").lower() in ("true", "1", "yes"):
+        if USE_TESTNET_MODE:
             ex.set_sandbox_mode(True)
             
         return ex
 
     def _binance_usdm_rest_base_url(self) -> str:
-        if os.getenv("USE_TESTNET", "False").lower() in ("true", "1", "yes"):
+        if USE_TESTNET_MODE:
             return "https://testnet.binancefuture.com"
         return "https://fapi.binance.com"
 
@@ -1026,7 +1075,7 @@ class ExecutionEngine:
             for pos in positions:
                 size = safe_decimal(pos.get('contracts', 0))
                 mark_price = safe_decimal(pos.get('markPrice', 0))
-                pos_side = pos.get('side', '').lower()
+                pos_side = self._extract_position_direction(pos)
                 
                 if size > Decimal("0") and mark_price > Decimal("0"):
                     notional = size * mark_price
@@ -1040,7 +1089,7 @@ class ExecutionEngine:
             
             # 预估下单后的持仓价值
             if side:
-                side = side.lower()
+                side = str(side or '').lower()
                 if side == 'buy':
                     # 如果当前有空单，buy 会优先平空单，多出部分算多单开仓
                     if current_short_notional > 0:
@@ -1065,7 +1114,11 @@ class ExecutionEngine:
             if estimated_notional > dynamic_max_position:
                 return False, f"开仓后总持仓价值 (${estimated_notional}) 将超过动态风险限额 ${dynamic_max_position} (当前基础限额 ${RISK_CONFIG['MAX_POSITION_USD']})"
         except Exception as e:
-            logger.warning(f"获取持仓或权益失败，略过持仓限制检查: {e}")
+            message = f"获取持仓或权益失败: {e}"
+            if not RISK_CONFIG["RISK_CHECK_FAIL_OPEN"]:
+                logger.exception(f"{message}，风控失败默认拒单。")
+                return False, message
+            logger.exception(f"{message}，RISK_CHECK_FAIL_OPEN=true，按配置略过持仓限制检查。")
 
         # 4. 检查盘口流动性 (防滑点)
         try:
@@ -1155,10 +1208,37 @@ class ExecutionEngine:
 
         设计原因：
         - -2022 常见于旧保护单占用数量、对冲模式参数不完整等场景；
+        - 部分交易所/本地化接口会返回中文“只减仓订单失败”，没有英文 reduceOnly 或错误码；
         - 将识别逻辑单独抽出，便于主平仓流程和后续重试逻辑共用。
         """
         normalized = str(message or "").lower()
-        return "-2022" in normalized or "reduceonly order is rejected" in normalized
+        compact = normalized.replace(" ", "").replace("_", "")
+        return (
+            "-2022" in normalized
+            or "reduceonlyorderisrejected" in compact
+            or "reduceonlyisrejected" in compact
+            or "只减仓订单失败" in normalized
+            or ("只减仓" in normalized and "失败" in normalized)
+        )
+
+    def _position_matches_close_context(
+        self,
+        position: dict,
+        symbol: str,
+        original_side: str,
+        original_position_side: str | None,
+    ) -> bool:
+        if not self._symbol_matches(str(position.get("symbol") or ""), symbol):
+            return False
+        if safe_decimal(position.get("contracts", 0)) <= Decimal("0"):
+            return False
+
+        position_side = self._extract_position_side_param(position)
+        if original_position_side and position_side and position_side != original_position_side:
+            return False
+
+        side = str(position.get("side") or "").lower()
+        return not original_side or not side or side == original_side
 
     async def _submit_market_close_order(
         self,
@@ -1385,7 +1465,7 @@ class ExecutionEngine:
                 "order_id": order.get("id"),
                 "amount": amount_str,
                 "close_side": close_side,
-                "reduce_only_applied": submit_mode == "reduce_only",
+                "reduce_only_applied": "reduce_only" in submit_mode,
             }
         except Exception as exc:
             message = str(exc)
@@ -1393,17 +1473,39 @@ class ExecutionEngine:
                 raise
 
             logger.warning(
-                f"⚠️ {symbol} ReduceOnly 平仓被拒绝，尝试执行保护单清理 + positionSide 兜底重试: {message}"
+                f"⚠️ {symbol} ReduceOnly/只减仓平仓被拒绝，尝试撤全部挂单 + 刷新仓位后兜底重试: {message}"
             )
-            await self._cancel_protection_orders(symbol)
-            await asyncio.sleep(0.2)
+            try:
+                await self.cancel_all_orders(symbol)
+            except Exception as cancel_exc:
+                logger.warning(f"撤销 {symbol} 全部挂单失败，继续执行保护单清理和仓位刷新: {cancel_exc}")
+
+            cancelled_protection = await self._cancel_protection_orders(symbol)
+            if cancelled_protection:
+                logger.info(f"已额外清理 {symbol} 保护单数量: {cancelled_protection}")
+            await asyncio.sleep(float(os.getenv("KILL_SWITCH_CANCEL_SETTLE_SEC", "0.5") or 0.5))
 
             refreshed_positions, resolved_symbol = await self._fetch_positions_for_symbol(symbol)
             refreshed_position = None
             for pos in refreshed_positions or []:
-                if self._symbol_matches(str(pos.get("symbol") or ""), resolved_symbol) and safe_decimal(pos.get("contracts", 0)) > Decimal("0"):
+                if self._position_matches_close_context(pos, resolved_symbol, side, position_side):
                     refreshed_position = pos
                     break
+
+            if not refreshed_position:
+                for pos in refreshed_positions or []:
+                    if self._symbol_matches(str(pos.get("symbol") or ""), resolved_symbol) and safe_decimal(pos.get("contracts", 0)) > Decimal("0"):
+                        refreshed_position = pos
+                        logger.warning(
+                            "%s 未找到与原始方向完全一致的刷新仓位，改用交易所返回的剩余仓位继续清理: "
+                            "original_side=%s original_position_side=%s refreshed_side=%s refreshed_position_side=%s",
+                            symbol,
+                            side or "UNKNOWN",
+                            position_side or "NONE",
+                            str(pos.get("side") or "UNKNOWN"),
+                            self._extract_position_side_param(pos) or "NONE",
+                        )
+                        break
 
             if not refreshed_position:
                 return {
@@ -1427,14 +1529,14 @@ class ExecutionEngine:
             return {
                 "status": "success",
                 "mode": (
-                    "position_side_fallback"
-                    if submit_mode == "reduce_only"
-                    else "position_side_no_reduce_only_fallback"
+                    "cancel_all_refresh_reduce_only_fallback"
+                    if "reduce_only" in submit_mode
+                    else "cancel_all_refresh_no_reduce_only_fallback"
                 ),
                 "order_id": order.get("id"),
                 "amount": refreshed_amount_str,
                 "close_side": fallback_close_side,
-                "reduce_only_applied": submit_mode == "reduce_only",
+                "reduce_only_applied": "reduce_only" in submit_mode,
             }
 
     async def close_all_positions(self, symbol: str):
@@ -1480,7 +1582,7 @@ class ExecutionEngine:
                 continue
                 
             execution_symbol = str(pos.get("symbol") or resolved_symbol or symbol)
-            side = pos.get('side', '').lower()
+            side = self._extract_position_direction(pos)
             mark_price = safe_decimal(pos.get('markPrice', 0))
             entry_price = safe_decimal(pos.get('entryPrice', pos.get('entry_price', 0)))
             unrealized_pnl = safe_decimal(pos.get('unrealizedPnl', 0))
@@ -1904,8 +2006,36 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                     "status": "success_dry_run",
                     "execution_mode": "twap",
                     "twap_task_id": task_id,
-                    "message": f"[DRY-RUN] 订单金额 ${amount_usd_dec} 触发 TWAP 大额路由，已进入后台切片模拟执行。"
+                    "message": f"[DRY-RUN] 订单金额 ${amount_usd_dec} 触发 TWAP 大额路由，已进入后台切片模拟执行。",
+                    "child_orders": [
+                        {
+                            "child_order_id": f"{task_id}_planned_1",
+                            "sequence": 1,
+                            "status": "planned",
+                            "exchange_order_id": "",
+                            "notional_usd": str(effective_chunk_usd),
+                            "filled_quantity": "0",
+                            "average_price": "",
+                            "fee_usdt": "0.0",
+                            "reported_at": int(time.time()),
+                        }
+                    ],
                 }, ensure_ascii=False)
+
+            if not _production_live_order_allowed():
+                async with _get_twap_control_lock():
+                    if TWAP_ACTIVE_BY_SYMBOL.get(symbol) == task_id:
+                        TWAP_ACTIVE_BY_SYMBOL.pop(symbol, None)
+                task = TWAP_TASKS.get(task_id)
+                if isinstance(task, dict):
+                    task["status"] = "rejected"
+                    task["last_error"] = "LIVE_TRADING_ENABLED is required for production live orders"
+                    task["updated_at"] = int(time.time())
+                return MCPErrorResponse(
+                    status="rejected",
+                    error_code="LIVE_TRADING_DISABLED",
+                    message="生产实盘下单需要显式设置 LIVE_TRADING_ENABLED=true；当前订单已被拒绝。",
+                ).model_dump_json()
 
             try:
                 first_slice = await engine._execute_twap_slice(symbol, side, effective_chunk_usd, task_id, 1)
@@ -1941,7 +2071,20 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                 "order_id": first_slice.get("order_id"),
                 "filled_qty": first_slice.get("filled_qty"),
                 "average_price": first_slice.get("average_price"),
-                "fee": "0.0"
+                "fee": "0.0",
+                "child_orders": [
+                    {
+                        "child_order_id": f"{task_id}_child_1",
+                        "sequence": 1,
+                        "status": first_slice.get("status") or "unknown",
+                        "exchange_order_id": first_slice.get("order_id") or "",
+                        "notional_usd": first_slice.get("cost_usd") or str(effective_chunk_usd),
+                        "filled_quantity": first_slice.get("filled_qty") or "",
+                        "average_price": first_slice.get("average_price") or "",
+                        "fee_usdt": "0.0",
+                        "reported_at": int(time.time()),
+                    }
+                ],
             }, ensure_ascii=False)
 
         # 2. 计算下单数量
@@ -1983,6 +2126,14 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                 "fee": "0.0",
                 "note": "This is a simulated order generated in DRY_RUN_MODE."
             }, ensure_ascii=False)
+
+        if not _production_live_order_allowed():
+            logger.error("生产实盘下单被总开关拒绝: symbol=%s side=%s amount_usd=%s", symbol, side, amount_usd_dec)
+            return MCPErrorResponse(
+                status="rejected",
+                error_code="LIVE_TRADING_DISABLED",
+                message="生产实盘下单需要显式设置 LIVE_TRADING_ENABLED=true；当前订单已被拒绝。",
+            ).model_dump_json()
 
         # 3. 发送物理主订单
         try:
@@ -2201,6 +2352,12 @@ async def update_stop_loss(symbol: str, position_side: str, sl_price: float) -> 
                 },
                 ensure_ascii=False,
             )
+        if not _production_live_order_allowed():
+            return MCPErrorResponse(
+                status="rejected",
+                error_code="LIVE_TRADING_DISABLED",
+                message="生产实盘更新止损单需要显式设置 LIVE_TRADING_ENABLED=true；当前请求已被拒绝。",
+            ).model_dump_json()
 
         positions, resolved_symbol = await engine._fetch_positions_for_symbol(symbol)
         position = None
@@ -2297,6 +2454,12 @@ async def update_take_profit(symbol: str, position_side: str, tp_price: float) -
                 },
                 ensure_ascii=False,
             )
+        if not _production_live_order_allowed():
+            return MCPErrorResponse(
+                status="rejected",
+                error_code="LIVE_TRADING_DISABLED",
+                message="生产实盘更新止盈单需要显式设置 LIVE_TRADING_ENABLED=true；当前请求已被拒绝。",
+            ).model_dump_json()
 
         positions, resolved_symbol = await engine._fetch_positions_for_symbol(symbol)
         position = None

@@ -24,6 +24,7 @@ from shared.telegram_notifier import send_tg_alert
 from shared.db_manager import init_db, insert_trade_log, get_today_summary, get_recent_shadow_trades, get_system_metrics
 from shared.shadow_ledger import ShadowLedger, estimate_cost_usdt, safe_decimal
 from mvp_system.core.dynamic_allocator import DynamicAllocator
+from mvp_system.core.sentiment_risk_gate import SentimentRiskGate
 from datetime import datetime
 from skills_pool.shadow.shadow_manager import ShadowPoolManager
 from skills_pool.lifecycle_manager import StrategyLifecycleManager
@@ -39,6 +40,7 @@ dynamic_allocator = DynamicAllocator(config={
         "max_position_pct": 0.15
     }
 })
+sentiment_risk_gate = SentimentRiskGate()
 
 # 配置 CORS 允许前端跨域访问
 app.add_middleware(
@@ -387,7 +389,7 @@ async def analyze_and_trade(req: TradeRequest):
             )
             reply = response.content[0].text
             
-        elif agent.llm_provider in ["deepseek", "ofox"]:
+        elif agent.llm_provider in ["deepseek", "ofox", "siliconflow"]:
             # DeepSeek/Ofox 调用 (OpenAI 兼容)
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -471,6 +473,43 @@ async def analyze_and_trade(req: TradeRequest):
                 action=action,
                 current_balance=usdt_balance
             )
+            sentiment_decision = sentiment_risk_gate.evaluate(
+                action=action,
+                sentiment_data=factor_payload.get("comprehensive_sentiment")
+                if isinstance(factor_payload.get("comprehensive_sentiment"), dict)
+                else factor_payload.get("real_sentiment"),
+                factor_data=factor_payload,
+            )
+            sentiment_payload = sentiment_decision.to_payload()
+            logger.info(
+                "DB_RECORD %s",
+                json.dumps(
+                    {
+                        "module": "api_server",
+                        "event": "sentiment_risk_gate",
+                        "symbol": req.symbol,
+                        "action": action,
+                        "decision": sentiment_payload,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+            if not sentiment_decision.approved:
+                logger.warning(f"🛡️ [SentimentRiskGate] 舆情闸门拒绝发单: {sentiment_decision.reason}")
+                return TradeResponse(
+                    symbol=req.symbol,
+                    action="WAIT",
+                    reasoning=f"{reply[:420]}\n\n舆情闸门拒绝: {sentiment_decision.reason}",
+                    execution_status="Skipped (SentimentRiskGate rejected)",
+                )
+
+            if sentiment_decision.allocation_multiplier < 1:
+                original_dynamic_amount = dynamic_amount
+                dynamic_amount = float((Decimal(str(dynamic_amount)) * sentiment_decision.allocation_multiplier).quantize(Decimal("0.01")))
+                logger.info(
+                    f"🛡️ [SentimentRiskGate] 舆情风险降额: {original_dynamic_amount:.2f} -> {dynamic_amount:.2f}"
+                )
             
             if dynamic_amount < 10.0:
                 logger.warning(f"⚠️ 调度器批复的头寸 {dynamic_amount:.2f} USDT 低于最小发单金额，跳过本次发单！")

@@ -39,6 +39,26 @@ load_dotenv(override=True)
 
 logger = get_logger("Agent-Client")
 
+OPENAI_COMPATIBLE_PROVIDERS = {"deepseek", "ofox", "siliconflow"}
+
+STREAM_TRANSPORT_ERROR_MARKERS = (
+    "stream disconnected before completion",
+    "error decoding response body",
+    "network error",
+    "incomplete read",
+    "connection reset",
+    "connection aborted",
+    "remote protocol error",
+    "read timeout",
+    "broken pipe",
+)
+
+
+def is_stream_transport_error(exc: Exception) -> bool:
+    """识别上游流式响应中途断开的传输层错误。"""
+    message = str(exc).lower()
+    return any(marker in message for marker in STREAM_TRANSPORT_ERROR_MARKERS)
+
 DEFAULT_SYSTEM_PROMPT = """你是 TrendMaster PRO 的量化交易决策中枢，负责对加密货币市场进行审慎、可执行、可审计的分析。
 
 你的核心职责：
@@ -125,7 +145,7 @@ class TrendMasterAgent:
                 logger.error("未找到 ANTHROPIC_API_KEY，请检查 .env 文件")
                 sys.exit(1)
             self.anthropic = AsyncAnthropic(api_key=api_key)
-        elif self.llm_provider in ["deepseek", "ofox", "siliconflow"]:
+        elif self.llm_provider in OPENAI_COMPATIBLE_PROVIDERS:
             # 使用 OpenAI 兼容适配器
             self.deepseek = DeepSeekAdapter(provider=self.llm_provider)
         else:
@@ -268,6 +288,56 @@ class TrendMasterAgent:
             ]
         )
 
+    async def complete_anthropic_text(
+        self,
+        *,
+        system_prompt: str,
+        messages: List[MessageParam],
+        stream: bool,
+    ) -> str:
+        response = await self.anthropic.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=4096,
+            system=system_prompt,
+            messages=messages,
+            stream=stream,
+        )
+
+        if not stream:
+            return "".join(
+                block.text for block in response.content if getattr(block, "type", "") == "text"
+            )
+
+        final_reply_content = ""
+        async for event in response:
+            if event.type == "text_delta":
+                text = event.delta.text
+                print(text, end="", flush=True)
+                final_reply_content += text
+        return final_reply_content
+
+    async def complete_openai_compatible_text(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        stream: bool,
+    ) -> str:
+        response = await self.deepseek.chat_completion(
+            messages=messages,
+            stream=stream,
+        )
+
+        if not stream:
+            return response.choices[0].message.content or ""
+
+        final_reply_content = ""
+        async for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                text = chunk.choices[0].delta.content
+                print(text, end="", flush=True)
+                final_reply_content += text
+        return final_reply_content
+
     async def build_multifactor_payload(self, symbol: str, timeframe: str) -> Dict[str, Any]:
         """按配置构建真实多维因子载荷，禁止注入假数据。"""
         generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -304,6 +374,38 @@ class TrendMasterAgent:
                         f"当前 {result['symbol']} 资金费率为 {result['formatted']}。"
                     )
 
+        if "get_comprehensive_sentiment" in self.tool_routing_map:
+            try:
+                sentiment_result = await self.call_mcp_tool_directly(
+                    "Sentiment-MCP",
+                    "get_comprehensive_sentiment",
+                    {"symbol": symbol, "timeframe": timeframe},
+                )
+                if isinstance(sentiment_result, str):
+                    sentiment_result = json.loads(sentiment_result)
+                if isinstance(sentiment_result, dict):
+                    real_sentiment = sentiment_result.get("real_sentiment")
+                    if isinstance(real_sentiment, dict):
+                        factor_payload["real_sentiment"] = real_sentiment
+                        factor_payload["comprehensive_sentiment"] = sentiment_result
+                        score = real_sentiment.get("overall_sentiment_score")
+                        label = real_sentiment.get("overall_sentiment_label")
+                        bias = real_sentiment.get("market_bias")
+                        factor_payload["factor_lines"].append(
+                            f"真实综合舆情分数为 {score}，标签 {label}，市场偏向 {bias}。"
+                        )
+                        disabled_sources = [
+                            source.get("source")
+                            for source in real_sentiment.get("source_status", [])
+                            if isinstance(source, dict) and source.get("status") in {"disabled", "degraded"}
+                        ]
+                        if disabled_sources:
+                            factor_payload["factor_lines"].append(
+                                "以下舆情源不可作为方向依据: " + ", ".join(str(item) for item in disabled_sources)
+                            )
+            except Exception as exc:
+                logger.warning(f"⚠️ 综合真实舆情拉取失败，已跳过该维度: {exc}")
+
         factor_payload["enabled_factors"] = [
             key for key, enabled in feed_config.items() if enabled
         ]
@@ -326,6 +428,17 @@ class TrendMasterAgent:
             prompt_lines.append("- 已启用真实因子，但本轮拉取失败，禁止以假数据代替。")
         else:
             prompt_lines.append("- 当前未启用额外真实因子开关。")
+
+        real_sentiment = factor_payload.get("real_sentiment")
+        if isinstance(real_sentiment, dict):
+            prompt_lines.extend(
+                [
+                    "",
+                    "【真实舆情结构化摘要】",
+                    json.dumps(real_sentiment, ensure_ascii=False, default=str),
+                    "决策要求：必须基于上述 source_status 判断来源可用性；disabled/unreliable 来源不得作为 BUY/SELL 依据。",
+                ]
+            )
 
         return "\n".join(prompt_lines)
 
@@ -512,7 +625,7 @@ class TrendMasterAgent:
                     continue
 
                 system_prompt = self.build_runtime_system_prompt()
-                if self.llm_provider in ["deepseek", "ofox"]:
+                if self.llm_provider in OPENAI_COMPATIBLE_PROVIDERS:
                     if messages and messages[0].get("role") == "system":
                         messages[0]["content"] = system_prompt
                     else:
@@ -570,7 +683,7 @@ class TrendMasterAgent:
                 )
                     
                 # 统一添加 User Message
-                if self.llm_provider in ["deepseek", "ofox"]:
+                if self.llm_provider in OPENAI_COMPATIBLE_PROVIDERS:
                     messages.append({"role": "user", "content": enriched_input})
                 else:
                     anthropic_messages.append({"role": "user", "content": enriched_input})
@@ -587,33 +700,47 @@ class TrendMasterAgent:
                 try:
                     if self.llm_provider == "anthropic":
                         # Anthropic 流式调用逻辑
-                        response_stream = await self.anthropic.messages.create(
-                            model="claude-3-5-sonnet-20241022",
-                            max_tokens=4096,
-                            system=system_prompt,
-                            messages=anthropic_messages,
-                            stream=True
-                        )
-                        
-                        async for event in response_stream:
-                            if event.type == "text_delta":
-                                text = event.delta.text
-                                print(text, end="", flush=True)
-                                final_reply_content += text
-                                
+                        try:
+                            final_reply_content = await self.complete_anthropic_text(
+                                system_prompt=system_prompt,
+                                messages=anthropic_messages,
+                                stream=True,
+                            )
+                        except Exception as stream_exc:
+                            if not is_stream_transport_error(stream_exc):
+                                raise
+                            logger.warning(
+                                f"⚠️ Anthropic 流式响应中断，自动切换为非流式重试: {stream_exc}"
+                            )
+                            print("\n[流式连接中断，正在补偿重试...]", flush=True)
+                            final_reply_content = await self.complete_anthropic_text(
+                                system_prompt=system_prompt,
+                                messages=anthropic_messages,
+                                stream=False,
+                            )
+                            print(final_reply_content, end="", flush=True)
+
                         anthropic_messages.append({"role": "assistant", "content": final_reply_content})
                         
-                    elif self.llm_provider in ["deepseek", "ofox"]:
+                    elif self.llm_provider in OPENAI_COMPATIBLE_PROVIDERS:
                         # OpenAI 兼容流式调用逻辑
-                        response_stream = await self.deepseek.chat_completion(
-                            messages=messages
-                        )
-                        
-                        async for chunk in response_stream:
-                            if chunk.choices and chunk.choices[0].delta.content:
-                                text = chunk.choices[0].delta.content
-                                print(text, end="", flush=True)
-                                final_reply_content += text
+                        try:
+                            final_reply_content = await self.complete_openai_compatible_text(
+                                messages=messages,
+                                stream=True,
+                            )
+                        except Exception as stream_exc:
+                            if not is_stream_transport_error(stream_exc):
+                                raise
+                            logger.warning(
+                                f"⚠️ OpenAI 兼容流式响应中断，自动切换为非流式重试: {stream_exc}"
+                            )
+                            print("\n[流式连接中断，正在补偿重试...]", flush=True)
+                            final_reply_content = await self.complete_openai_compatible_text(
+                                messages=messages,
+                                stream=False,
+                            )
+                            print(final_reply_content, end="", flush=True)
                                 
                         messages.append({"role": "assistant", "content": final_reply_content})
                         

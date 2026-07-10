@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 import asyncio
 import httpx
 from datetime import datetime, timedelta
-import random
 import json
 from bs4 import BeautifulSoup
 import feedparser
@@ -21,6 +20,145 @@ logger = get_logger("Sentiment-Server")
 mcp = FastMCP("Sentiment-Server")
 
 sentiment_cache = TTLCache(maxsize=50, ttl=300.0)
+
+
+def _source_status(source: str, status: str, reliability: str, reason: str = "") -> dict:
+    return {
+        "source": source,
+        "status": status,
+        "reliability": reliability,
+        "reason": reason,
+    }
+
+
+def _score_fear_greed(fng_data: dict) -> float:
+    try:
+        value = float(fng_data.get("value"))
+    except Exception:
+        return 0.0
+    return max(-1.0, min(1.0, (value - 50.0) / 50.0))
+
+
+def _score_news_items(news_data: list) -> float:
+    if not news_data:
+        return 0.0
+    positive_terms = ("approve", "approved", "etf inflow", "inflow", "rally", "surge", "gain")
+    negative_terms = ("ban", "lawsuit", "sues", "hack", "exploit", "outflow", "selloff", "crackdown")
+    score = 0.0
+    counted = 0
+    for item in news_data:
+        text = str(item or "").lower()
+        if not text:
+            continue
+        counted += 1
+        if any(term in text for term in positive_terms):
+            score += 0.25
+        if any(term in text for term in negative_terms):
+            score -= 0.35
+    if counted <= 0:
+        return 0.0
+    return max(-1.0, min(1.0, score / max(1, counted)))
+
+
+def _normalize_macro_events(macro_data: list) -> list[dict]:
+    events = []
+    for item in macro_data or []:
+        text = str(item or "").strip()
+        if not text or "Unavailable" in text:
+            continue
+        events.append(
+            {
+                "title": text,
+                "impact": "CRITICAL" if any(key in text.upper() for key in ("FOMC", "CPI", "NFP")) else "HIGH",
+                "source": "forexfactory_xml",
+            }
+        )
+    return events
+
+
+def build_real_sentiment_payload(
+    *,
+    symbol: str,
+    timeframe: str,
+    fng_data: dict,
+    news_data: list,
+    telegram_data: list,
+    macro_data: list,
+) -> dict:
+    fng_score = _score_fear_greed(fng_data if isinstance(fng_data, dict) else {})
+    news_score = _score_news_items(news_data if isinstance(news_data, list) else [])
+    macro_events = _normalize_macro_events(macro_data if isinstance(macro_data, list) else [])
+    macro_penalty = -0.25 if any(event.get("impact") == "CRITICAL" for event in macro_events) else 0.0
+    telegram_available = bool(
+        telegram_data
+        and isinstance(telegram_data, list)
+        and not any("Unavailable" in str(item) for item in telegram_data)
+    )
+    telegram_score = 0.0
+    if telegram_available:
+        joined = " ".join(str(item).lower() for item in telegram_data)
+        if "transferred to" in joined:
+            telegram_score -= 0.15
+        if "transferred from" in joined:
+            telegram_score += 0.10
+
+    weighted_score = (
+        fng_score * 0.45
+        + news_score * 0.30
+        + telegram_score * 0.10
+        + macro_penalty * 0.15
+    )
+    overall_score = round(max(-1.0, min(1.0, weighted_score)), 4)
+
+    source_status = [
+        _source_status(
+            "alternative.me/fng",
+            "ready" if isinstance(fng_data, dict) and "error" not in fng_data else "degraded",
+            "medium_high",
+            str((fng_data or {}).get("error") or ""),
+        ),
+        _source_status(
+            "cointelegraph/rss",
+            "ready" if news_data and not any("Unavailable" in str(item) for item in news_data) else "degraded",
+            "medium",
+        ),
+        _source_status(
+            "telegram/whale_alert_io_web",
+            "ready" if telegram_available else "degraded",
+            "medium_low",
+            "" if telegram_available else "web mirror unavailable or no matching message",
+        ),
+        _source_status(
+            "twitter/x",
+            "disabled",
+            "unreliable",
+            "mock source disabled for production decisions",
+        ),
+        _source_status(
+            "forexfactory/xml",
+            "ready" if macro_events else "degraded",
+            "medium",
+            "" if macro_events else "no high-impact USD events in current window or source unavailable",
+        ),
+    ]
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "overall_sentiment_score": overall_score,
+        "overall_sentiment_label": "积极" if overall_score > 0.2 else "消极" if overall_score < -0.2 else "中性",
+        "market_bias": "利多" if overall_score > 0.2 else "利空" if overall_score < -0.2 else "中性",
+        "components": {
+            "fear_greed_score": round(fng_score, 4),
+            "news_score": round(news_score, 4),
+            "telegram_flow_score": round(telegram_score, 4),
+            "macro_event_penalty": round(macro_penalty, 4),
+        },
+        "macro_events": macro_events,
+        "source_status": source_status,
+        "usable_for_trading": any(source.get("status") == "ready" for source in source_status[:3]),
+    }
 
 
 class SentimentEngine:
@@ -97,23 +235,10 @@ class SentimentEngine:
         """
         [Phase 3 预留] 监听 Twitter 核心人物动态
         通过 RSSHub 或第三方 API 接口抓取核心人物的推文。
-        目前为代码骨架，返回 Mock 结构，待未来部署 RSSHub 后填充真实 URL。
+        当前未配置真实数据源时返回空列表，禁止 mock 数据进入生产决策。
         """
-        try:
-            # TODO: 未来替换为真实的 RSSHub URL，例如 "https://rsshub.app/twitter/user/{author}"
-            # 或者通过 RapidAPI 等第三方推特抓取服务
-            
-            # url = f"https://api.example.com/twitter/{author}"
-            # response = await self.http_client.get(url)
-            # data = response.json()
-            
-            # 当前返回代码骨架/Mock 数据
-            logger.info(f"预留 Twitter 监听骨架被调用: 目标人物 @{author}")
-            return [f"Mock Data: @{author} is watching the crypto market closely."]
-            
-        except Exception as e:
-            logger.error(f"获取 Twitter 动态失败: {e}")
-            return ["Twitter API Unavailable"]
+        logger.info(f"Twitter/X 真实数据源未配置，跳过 @{author}，不注入 mock 数据。")
+        return []
 
     async def get_macro_calendar(self) -> list:
         """
@@ -235,23 +360,34 @@ async def get_comprehensive_sentiment(symbol: str, timeframe: str = "15m") -> st
         fng_data, news_data, tg_data, tw_data, macro_data = await asyncio.gather(
             fng_task, crypto_news_task, telegram_task, twitter_task, macro_task
         )
+        real_sentiment = build_real_sentiment_payload(
+            symbol=symbol,
+            timeframe=timeframe,
+            fng_data=fng_data,
+            news_data=news_data,
+            telegram_data=tg_data,
+            macro_data=macro_data,
+        )
 
         sentiment_payload = {
             "symbol": symbol,
             "timeframe": timeframe,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "real_sentiment": real_sentiment,
             "market_fear_greed": fng_data,
             "social_and_news": {
                 "crypto_news": news_data,
                 "telegram_whale_alerts": tg_data,
                 "twitter_alpha": tw_data
             },
-            "upcoming_macro_events": macro_data,
+            "upcoming_macro_events": real_sentiment.get("macro_events", []) or _normalize_macro_events(macro_data),
+            "source_status": real_sentiment["source_status"],
             "system_instruction": (
                 "请结合 Indicator-MCP 的技术面数据进行终极裁决。\n"
                 "1. 宏观风控: 若面临 CRITICAL 级别宏观事件（如 FOMC/CPI），除非技术面有绝对的流动性确认，否则请强制输出 WAIT 观望。\n"
                 "2. 链上与消息面: 密切关注 Telegram 的巨鲸充提币动向(流入交易所往往砸盘，流出往往拉盘)以及 CryptoNews 的监管动态。\n"
-                "3. 情绪逆向: 若技术面看多，但市场极度贪婪(FGI > 80)，请警惕诱多陷阱；若极度恐慌(FGI < 20)且出现巨鲸提币，可能是黄金坑。"
+                "3. 情绪逆向: 若技术面看多，但市场极度贪婪(FGI > 80)，请警惕诱多陷阱；若极度恐慌(FGI < 20)且出现巨鲸提币，可能是黄金坑。\n"
+                "4. 严禁使用 source_status=disabled/unreliable 的来源做方向判断。"
             ),
         }
 

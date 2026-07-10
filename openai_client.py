@@ -27,7 +27,9 @@ class DeepSeekAdapter:
             
         self.client = AsyncOpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            max_retries=int(os.getenv("LLM_API_MAX_RETRIES", "2") or 2),
+            timeout=float(os.getenv("LLM_API_TIMEOUT_SEC", "60") or 60),
         )
 
     def convert_tools_to_openai_format(self, anthropic_tools: list) -> list:

@@ -60,7 +60,7 @@ from asyncache import cached
 load_dotenv()
 
 logger = get_logger("Execution-Server")
-mcp = FastMCP("Execution-Server", port=8000)
+mcp = FastMCP("Execution-Server", host="0.0.0.0", port=8000)
 
 # 在执行层实例化一个本地的 ShadowLedger，用于 TWAP 后台任务的切片资金预扣和管理
 # 初始化可用资金先置为0，在每次执行真实发单前会通过 fetch_balance 同步
@@ -923,15 +923,15 @@ class ExecutionEngine:
         # 实例化 ccxt 异步引擎 (虽然是异步类，但实例化过程包含复杂的正则预编译和配置加载)
         ex = getattr(ccxt.async_support, self.exchange_id)(exchange_config)
         
-        # 如果是 Testnet，开启沙盒模式
+        # Binance 已将 Futures Sandbox 迁移为统一 Demo Trading。
         if USE_TESTNET_MODE:
-            ex.set_sandbox_mode(True)
+            ex.enable_demo_trading(True)
             
         return ex
 
     def _binance_usdm_rest_base_url(self) -> str:
         if USE_TESTNET_MODE:
-            return "https://testnet.binancefuture.com"
+            return "https://demo-fapi.binance.com"
         return "https://fapi.binance.com"
 
     def _binance_symbol_id(self, symbol: str) -> str:

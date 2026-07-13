@@ -226,7 +226,7 @@ async def execute_exchange_request(
             exchange = build_exchange_from_config(config)
             setattr(exchange, "_indicator_route_name", f"sdk_{route_name}")
             if should_use_indicator_testnet():
-                exchange.set_sandbox_mode(True)
+                exchange.enable_demo_trading(True)
             await exchange.load_markets()
             result = await request_builder(exchange)
             breaker.record_success()
@@ -1302,7 +1302,7 @@ async def analyze_smc(symbol: str, timeframe: str = '1h') -> str:
     config = get_exchange_config()
     exchange = build_exchange_from_config(config)
     if should_use_indicator_testnet():
-        exchange.set_sandbox_mode(True)
+        exchange.enable_demo_trading(True)
     
     try:
         await exchange.load_markets()
@@ -1449,7 +1449,7 @@ async def get_market_regime_hmm(symbol: str, timeframe: str = '1h') -> str:
     config = get_exchange_config()
     exchange = build_exchange_from_config(config)
     if should_use_indicator_testnet():
-        exchange.set_sandbox_mode(True)
+        exchange.enable_demo_trading(True)
     
     try:
         await exchange.load_markets()
@@ -1532,7 +1532,7 @@ async def analyze_orderflow(symbol: str) -> str:
     config = get_exchange_config()
     exchange = build_exchange_from_config(config)
     if should_use_indicator_testnet():
-        exchange.set_sandbox_mode(True)
+        exchange.enable_demo_trading(True)
     
     try:
         await exchange.load_markets()

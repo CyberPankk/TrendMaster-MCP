@@ -96,7 +96,7 @@ async def get_ticker(symbol: str) -> str:
     
     # 如果开启了 Testnet，必须显式设置
     if os.getenv("USE_TESTNET", "False").lower() in ("true", "1", "yes"):
-        exchange.set_sandbox_mode(True)
+        exchange.enable_demo_trading(True)
     
     try:
         # 异步请求行情数据
@@ -160,7 +160,7 @@ async def get_orderbook_ofi(symbol: str) -> str:
     exchange = ccxt.binanceusdm(config)
     
     if os.getenv("USE_TESTNET", "False").lower() in ("true", "1", "yes"):
-        exchange.set_sandbox_mode(True)
+        exchange.enable_demo_trading(True)
     
     try:
         # 获取深度为20的盘口数据

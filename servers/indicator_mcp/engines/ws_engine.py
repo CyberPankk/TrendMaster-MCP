@@ -28,7 +28,7 @@ class WsMemoryPool:
             
             # 【修复点 1】：显式适配 Testnet (根据您的环境变量)
             if os.getenv("USE_TESTNET", "False").lower() in ("true", "1", "yes"):
-                self.ex.set_sandbox_mode(True)
+                self.ex.enable_demo_trading(True)
                 logger.info("🧪 WS 引擎已开启 Sandbox 测试网模式")
 
             logger.info("🟢 CCXT Pro WebSocket Client 初始化完成！")

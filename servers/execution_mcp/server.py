@@ -923,16 +923,114 @@ class ExecutionEngine:
         # 实例化 ccxt 异步引擎 (虽然是异步类，但实例化过程包含复杂的正则预编译和配置加载)
         ex = getattr(ccxt.async_support, self.exchange_id)(exchange_config)
         
-        # Binance 已将 Futures Sandbox 迁移为统一 Demo Trading。
+        # 新版 CCXT 提供 enable_demo_trading；当前锁定的 CCXT 4.1.x
+        # 仍使用 set_sandbox_mode。两种版本都必须落到 Binance 测试环境，
+        # 不能因为 SDK 方法差异让持仓查询和真实测试网发单失效。
         if USE_TESTNET_MODE:
-            ex.enable_demo_trading(True)
+            enable_demo_trading = getattr(ex, "enable_demo_trading", None)
+            if callable(enable_demo_trading):
+                enable_demo_trading(True)
+                logger.info("Execution exchange configured for Binance Demo Trading")
+            else:
+                set_sandbox_mode = getattr(ex, "set_sandbox_mode", None)
+                if not callable(set_sandbox_mode):
+                    raise RuntimeError(
+                        "Installed CCXT does not support Binance test environment configuration"
+                    )
+                set_sandbox_mode(True)
+                logger.info("Execution exchange configured for Binance Futures Testnet")
             
         return ex
 
-    def _binance_usdm_rest_base_url(self) -> str:
+    def _binance_usdm_rest_order_url(self) -> str:
+        """
+        返回与当前 CCXT 实例完全一致的 U 本位合约下单地址。
+
+        `set_sandbox_mode(True)` 使用 testnet.binancefuture.com，而新版
+        `enable_demo_trading(True)` 使用 demo-fapi.binance.com。这里不能按
+        USE_TESTNET_MODE 硬编码，否则持仓查询和紧急平仓可能落到两个不同环境。
+        """
+        try:
+            api_urls = (self.ex.urls or {}).get("api", {}) if self.ex else {}
+            if isinstance(api_urls, dict):
+                configured = api_urls.get("fapiPrivate") or api_urls.get("fapiPublic")
+                if configured:
+                    return f"{str(configured).rstrip('/')}/order"
+        except Exception as exc:
+            logger.warning("读取 CCXT Binance Futures 下单地址失败，使用安全回退: %s", exc)
+
         if USE_TESTNET_MODE:
-            return "https://demo-fapi.binance.com"
-        return "https://fapi.binance.com"
+            return "https://testnet.binancefuture.com/fapi/v1/order"
+        return "https://fapi.binance.com/fapi/v1/order"
+
+    def _binance_usdm_rest_url(self, path: str) -> str:
+        """基于当前 CCXT 环境拼出同一 Binance U 本位 REST 地址。"""
+        normalized_path = f"/{str(path or '').lstrip('/')}"
+        order_url = self._binance_usdm_rest_order_url()
+        marker = "/fapi/"
+        if marker in order_url:
+            return f"{order_url.split(marker, 1)[0]}{normalized_path}"
+        return f"{order_url.rsplit('/order', 1)[0]}{normalized_path}"
+
+    async def _fetch_binance_usdm_positions_direct(
+        self,
+        symbol: str | None = None,
+        timeout_sec: float = 12.0,
+    ) -> list[dict]:
+        """
+        紧急平仓后的独立 REST 复查通道。
+
+        避免复用 CCXT 长连接/限频队列，防止市价单已经成交但 MCP 一直卡在
+        `fetch_positions`，最终让前端误以为平仓失败。
+        """
+        if not self.api_key or not self.secret:
+            raise ValueError("Missing API credentials")
+
+        payload: dict[str, object] = {
+            "recvWindow": int(os.getenv("BINANCE_RECV_WINDOW_MS", "5000") or 5000),
+            "timestamp": int(time.time() * 1000),
+        }
+        if symbol:
+            payload["symbol"] = self._binance_symbol_id(symbol)
+        query = urllib.parse.urlencode(payload)
+        signature = hmac.new(
+            self.secret.encode("utf-8"),
+            query.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        url = f"{self._binance_usdm_rest_url('/fapi/v2/positionRisk')}?{query}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        proxy_url = os.getenv("CCXT_PROXY") or None
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+
+        async def _get_positions(active_proxy: str | None) -> list[dict]:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+                async with session.get(url, headers=headers, proxy=active_proxy) as response:
+                    response_text = await response.text()
+                    try:
+                        data = json.loads(response_text)
+                    except Exception:
+                        data = {"raw": response_text}
+                    if response.status >= 400:
+                        code = data.get("code") if isinstance(data, dict) else None
+                        message = data.get("msg") if isinstance(data, dict) else response_text
+                        raise RuntimeError(
+                            f"Binance direct position verification failed: "
+                            f"status={response.status} code={code} msg={message}"
+                        )
+                    return data if isinstance(data, list) else []
+
+        try:
+            return await _get_positions(proxy_url)
+        except (aiohttp.ClientProxyConnectionError, aiohttp.ClientConnectorError) as exc:
+            if not proxy_url:
+                raise
+            logger.warning(
+                "Binance 平仓复查代理不可达，安全降级为直连: proxy=%s error=%s",
+                proxy_url,
+                exc,
+            )
+            return await _get_positions(None)
 
     def _binance_symbol_id(self, symbol: str) -> str:
         try:
@@ -982,7 +1080,7 @@ class ExecutionEngine:
         query = urllib.parse.urlencode(payload)
         signature = hmac.new(self.secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
         body = f"{query}&signature={signature}"
-        url = f"{self._binance_usdm_rest_base_url()}/fapi/v1/order"
+        url = self._binance_usdm_rest_order_url()
         proxy_url = os.getenv("CCXT_PROXY") or None
         headers = {
             "X-MBX-APIKEY": self.api_key,
@@ -990,24 +1088,41 @@ class ExecutionEngine:
         }
 
         timeout = aiohttp.ClientTimeout(total=timeout_sec)
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.post(url, data=body, headers=headers, proxy=proxy_url) as response:
-                response_text = await response.text()
-                try:
-                    data = json.loads(response_text)
-                except Exception:
-                    data = {"raw": response_text}
-                if response.status >= 400:
-                    code = data.get("code") if isinstance(data, dict) else None
-                    message = data.get("msg") if isinstance(data, dict) else response_text
-                    raise RuntimeError(
-                        f"Binance direct market close failed: status={response.status} "
-                        f"code={code} msg={message}"
-                    )
-                if isinstance(data, dict):
-                    data.setdefault("id", data.get("orderId"))
-                    data.setdefault("clientOrderId", data.get("clientOrderId"))
-                return data if isinstance(data, dict) else {"raw": data}
+
+        async def _post_order(active_proxy: str | None) -> dict:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+                async with session.post(url, data=body, headers=headers, proxy=active_proxy) as response:
+                    response_text = await response.text()
+                    try:
+                        data = json.loads(response_text)
+                    except Exception:
+                        data = {"raw": response_text}
+                    if response.status >= 400:
+                        code = data.get("code") if isinstance(data, dict) else None
+                        message = data.get("msg") if isinstance(data, dict) else response_text
+                        raise RuntimeError(
+                            f"Binance direct market close failed: status={response.status} "
+                            f"code={code} msg={message}"
+                        )
+                    if isinstance(data, dict):
+                        data.setdefault("id", data.get("orderId"))
+                        data.setdefault("clientOrderId", data.get("clientOrderId"))
+                    return data if isinstance(data, dict) else {"raw": data}
+
+        try:
+            return await _post_order(proxy_url)
+        except (aiohttp.ClientProxyConnectionError, aiohttp.ClientConnectorError) as exc:
+            if not proxy_url:
+                raise
+            # 只有明确“代理尚未建立连接”时才直连重试。响应超时等不确定状态不重试，
+            # 避免交易所已成交但响应丢失时重复提交平仓单。
+            logger.warning(
+                "Binance 紧急平仓代理不可达，安全降级为直连: proxy=%s url=%s error=%s",
+                proxy_url,
+                url,
+                exc,
+            )
+            return await _post_order(None)
 
     async def init_exchange(self):
         if not self.ex:
@@ -2651,12 +2766,21 @@ async def kill_all_positions(symbol: str) -> str:
         logger.info(f"已平仓 {symbol} 的 {closed_count} 个持仓。")
 
         # 再次复查交易所持仓，避免 symbol 口径异常或交易所拒单时出现“假成功”。
-        remaining_positions, resolved_symbol = await engine._fetch_positions_for_symbol(symbol)
-        live_positions = [
-            pos
-            for pos in (remaining_positions or [])
-            if safe_decimal(pos.get("contracts", 0)) > Decimal("0")
-        ]
+        if engine.exchange_id == "binanceusdm":
+            resolved_symbol = engine._binance_symbol_id(symbol)
+            remaining_positions = await engine._fetch_binance_usdm_positions_direct(symbol)
+            live_positions = [
+                pos
+                for pos in (remaining_positions or [])
+                if abs(safe_decimal(pos.get("positionAmt", 0))) > Decimal("0")
+            ]
+        else:
+            remaining_positions, resolved_symbol = await engine._fetch_positions_for_symbol(symbol)
+            live_positions = [
+                pos
+                for pos in (remaining_positions or [])
+                if safe_decimal(pos.get("contracts", 0)) > Decimal("0")
+            ]
         if live_positions:
             logger.error(
                 "❌ Kill switch 执行后仍有持仓残留: requested=%s resolved=%s remaining=%s",
@@ -2665,8 +2789,8 @@ async def kill_all_positions(symbol: str) -> str:
                 [
                     {
                         "symbol": str(pos.get("symbol") or resolved_symbol or symbol),
-                        "contracts": str(pos.get("contracts", 0)),
-                        "side": pos.get("side"),
+                        "contracts": str(pos.get("contracts", pos.get("positionAmt", 0))),
+                        "side": pos.get("side") or pos.get("positionSide"),
                     }
                     for pos in live_positions
                 ],
@@ -2742,6 +2866,50 @@ async def kill_all_positions_global() -> str:
             except Exception as e:
                 errors.append({"symbol": sym, "stage": "close_all_positions", "error": str(e)})
 
+        # 全局熔断不能仅凭“请求已发送”报告成功，必须以交易所真实持仓复查为准。
+        remaining = []
+        verification_error = None
+        try:
+            if engine.exchange_id == "binanceusdm":
+                verified_positions = await engine._fetch_binance_usdm_positions_direct()
+            else:
+                verified_positions = await engine.ex.fetch_positions()
+            for position in verified_positions or []:
+                contracts = abs(
+                    safe_decimal(
+                        position.get("positionAmt", position.get("contracts", 0))
+                    )
+                )
+                if contracts > Decimal("0"):
+                    remaining.append(
+                        {
+                            "symbol": str(position.get("symbol") or ""),
+                            "contracts": str(contracts),
+                            "side": str(position.get("side") or position.get("positionSide") or ""),
+                        }
+                    )
+        except Exception as exc:
+            verification_error = str(exc)
+            errors.append({"symbol": "GLOBAL", "stage": "verify_positions", "error": verification_error})
+
+        if verification_error or remaining:
+            message = (
+                f"Global kill switch 未确认清仓，剩余持仓: {remaining}"
+                if remaining
+                else f"Global kill switch 无法复查交易所持仓: {verification_error}"
+            )
+            logger.error("❌ %s", message)
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "KILL_SWITCH_GLOBAL_UNCONFIRMED",
+                    "message": message,
+                    "errors": errors,
+                    "remaining_positions": remaining,
+                },
+                ensure_ascii=False,
+            )
+
         return json.dumps(
             {
                 "status": "success",
@@ -2750,6 +2918,8 @@ async def kill_all_positions_global() -> str:
                 "orders_cancelled_symbols": cancelled,
                 "positions_closed_count": closed,
                 "errors": errors,
+                "remaining_positions": [],
+                "auto_flatten_confirmed": True,
             },
             ensure_ascii=False
         )

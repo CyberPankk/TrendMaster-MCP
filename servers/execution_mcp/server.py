@@ -214,8 +214,9 @@ def _production_live_order_allowed() -> bool:
 
 # --- 动态加载风控阈值与安全开关 ---
 RISK_CONFIG = {
-    "MAX_ORDER_USD": Decimal(os.getenv("MAX_ORDER_USD", "5000")),
-    "MAX_POSITION_USD": Decimal(os.getenv("MAX_POSITION_USD", "20000")),
+    "MAX_ORDER_USD": Decimal(os.getenv("MAX_ORDER_USD", "500")),
+    "MAX_POSITION_USD": Decimal(os.getenv("MAX_POSITION_USD", "2000")),
+    "MAX_TWAP_TOTAL_USD": Decimal(os.getenv("MAX_TWAP_TOTAL_USD", "1000")),
     "MAX_SPREAD_PCT": Decimal(os.getenv("MAX_SPREAD_PCT", "0.005")),
     "VOLATILITY_THRESHOLD": Decimal("0.02"), # 波动率阈值 (2%)，超过则禁止市价单
     "DRY_RUN_MODE": _env_flag("DRY_RUN_MODE", True),
@@ -1186,6 +1187,8 @@ class ExecutionEngine:
         # 1. 检查单笔金额
         if (not is_algo_order) and amount_usd > RISK_CONFIG["MAX_ORDER_USD"]:
             return False, f"订单金额 ${amount_usd} 超过限额 ${RISK_CONFIG['MAX_ORDER_USD']}"
+        if is_algo_order and amount_usd > RISK_CONFIG["MAX_TWAP_TOTAL_USD"]:
+            return False, f"TWAP 总金额 ${amount_usd} 超过账户级限额 ${RISK_CONFIG['MAX_TWAP_TOTAL_USD']}"
         
         # 2. 检查波动率限制 (如果波动率过大，禁止市价单)
         if volatility_dec > RISK_CONFIG["VOLATILITY_THRESHOLD"] and order_type == 'market':
@@ -2119,13 +2122,12 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                     active_status = str(active.get("status")) if isinstance(active, dict) else ""
                     active_side = str(active.get("side") or "").lower() if isinstance(active, dict) else ""
                     if active_status == "running":
-                        if active_side == str(side).lower():
-                            return MCPErrorResponse(
-                                status="rejected",
-                                error_code="TWAP_IN_FLIGHT",
-                                message=f"{symbol} 存在在飞 TWAP 任务 {active_id}，拒绝叠加同向任务。",
-                            ).model_dump_json()
-                        await engine._cancel_twap_task(active_id, f"reverse signal: {active_side}->{side}")
+                        direction_label = "同向叠加" if active_side == str(side).lower() else "反向替换"
+                        return MCPErrorResponse(
+                            status="rejected",
+                            error_code="TWAP_IN_FLIGHT",
+                            message=f"{symbol} 存在在飞 TWAP 任务 {active_id}，拒绝{direction_label}；请等待完成或人工撤销。",
+                        ).model_dump_json()
                     if TWAP_ACTIVE_BY_SYMBOL.get(symbol) == active_id:
                         TWAP_ACTIVE_BY_SYMBOL.pop(symbol, None)
 

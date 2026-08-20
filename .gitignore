@@ -15,6 +15,7 @@ Docs/
 
 # Test files
 test_*.py
+!tests/test_execution_close_recovery.py
 system_integration_test.py
 
 # Python

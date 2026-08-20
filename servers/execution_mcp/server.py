@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import sys
 import sqlite3
@@ -71,6 +72,15 @@ TWAP_ACTIVE_BY_SYMBOL: dict[str, str] = {}
 TWAP_ASYNC_TASKS: dict[str, asyncio.Task] = {}
 TWAP_CONTROL_LOCK: asyncio.Lock | None = None
 PROTECTION_TASKS: dict[str, dict] = {}
+
+
+def _coerce_positive_float(value: object, default: float) -> float:
+    """把交易所可空数值安全转换为正浮点数。"""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return parsed if math.isfinite(parsed) and parsed > 0 else float(default)
 
 def _get_twap_control_lock() -> asyncio.Lock:
     global TWAP_CONTROL_LOCK
@@ -1315,6 +1325,11 @@ class ExecutionEngine:
         if raw_position_side in {"LONG", "SHORT"}:
             return raw_position_side
 
+        # Binance 单向持仓模式会明确返回 BOTH。此时 positionSide 必须省略（或保持 BOTH），
+        # 不能再根据 CCXT 的 side=long/short 推导成 LONG/SHORT，否则会触发 -4061。
+        if raw_position_side == "BOTH":
+            return None
+
         side = str(position.get("side") or "").lower()
         if side == "long":
             return "LONG"
@@ -1382,6 +1397,7 @@ class ExecutionEngine:
         amount_str: str,
         position_side: str | None,
         allow_reduce_only_retry: bool = True,
+        force_minimal_params: bool = False,
     ) -> tuple[dict, str]:
         """
         提交市价平仓单，并在交易所返回 -1106 时自动降级重试。
@@ -1393,8 +1409,8 @@ class ExecutionEngine:
         - 降级重试先使用最小参数集，兼容 Binance 单向持仓模式；仍失败时再按对冲模式补 positionSide。
         """
         order_timeout = float(os.getenv("KILL_SWITCH_ORDER_TIMEOUT_SEC", "12") or 12)
-        primary_params: dict[str, object] = {"reduceOnly": True}
-        if position_side:
+        primary_params: dict[str, object] = {} if force_minimal_params else {"reduceOnly": True}
+        if position_side and not force_minimal_params:
             primary_params["positionSide"] = position_side
 
         use_direct_binance_rest = (
@@ -1411,14 +1427,23 @@ class ExecutionEngine:
                     params=primary_params,
                     timeout_sec=order_timeout,
                 )
+                submit_mode = (
+                    "binance_rest_minimal_one_way_close"
+                    if force_minimal_params
+                    else "binance_rest_reduce_only"
+                )
                 logger.info(
-                    f"✅ {symbol} Binance REST reduceOnly 市价平仓已提交: side={close_side} "
+                    f"✅ {symbol} Binance REST 市价平仓已提交: mode={submit_mode} side={close_side} "
                     f"amount={amount_str} position_side={position_side or 'NONE'} order_id={order.get('id')}"
                 )
-                return order, "binance_rest_reduce_only"
+                return order, submit_mode
             except Exception as exc:
                 message = str(exc)
-                if not allow_reduce_only_retry or not self._is_reduce_only_not_required_error(message):
+                if (
+                    force_minimal_params
+                    or not allow_reduce_only_retry
+                    or not self._is_reduce_only_not_required_error(message)
+                ):
                     raise
 
                 logger.warning(
@@ -1475,14 +1500,19 @@ class ExecutionEngine:
                 ),
                 timeout=order_timeout,
             )
+            submit_mode = "minimal_one_way_close" if force_minimal_params else "reduce_only"
             logger.info(
-                f"✅ {symbol} reduceOnly 市价平仓已提交: side={close_side} amount={amount_str} "
+                f"✅ {symbol} 市价平仓已提交: mode={submit_mode} side={close_side} amount={amount_str} "
                 f"position_side={position_side or 'NONE'} order_id={order.get('id')}"
             )
-            return order, "reduce_only"
+            return order, submit_mode
         except Exception as exc:
             message = str(exc)
-            if not allow_reduce_only_retry or not self._is_reduce_only_not_required_error(message):
+            if (
+                force_minimal_params
+                or not allow_reduce_only_retry
+                or not self._is_reduce_only_not_required_error(message)
+            ):
                 raise
 
             logger.warning(
@@ -1660,6 +1690,9 @@ class ExecutionEngine:
                 close_side=fallback_close_side,
                 amount_str=refreshed_amount_str,
                 position_side=fallback_position_side,
+                # -2022 且刷新后仍为 BOTH，说明该 Binance 单向模式拒绝显式 reduceOnly。
+                # 此处刚重新读取过真实仓位和精确剩余数量，可安全使用最小参数反向市价单。
+                force_minimal_params=fallback_position_side is None,
             )
             return {
                 "status": "success",
@@ -1937,7 +1970,7 @@ async def get_position_snapshot(symbol: str) -> str:
         unrealized_pnl = safe_decimal(position.get("unrealizedPnl", position.get("unrealized_pnl", 0)))
         side = position.get("side") or position.get("positionSide") or position.get("position_side")
         normalized_side = engine._extract_position_direction(position)
-        leverage = float(position.get("leverage", 20))
+        leverage = _coerce_positive_float(position.get("leverage"), 20.0)
         initial_margin = safe_decimal(position.get("initialMargin", position.get("initial_margin", 0)))
         
         roe = 0.0
@@ -1984,7 +2017,7 @@ async def get_all_position_snapshots() -> str:
             mark_price = safe_decimal(position.get("markPrice", position.get("mark_price", 0)))
             unrealized_pnl = safe_decimal(position.get("unrealizedPnl", position.get("unrealized_pnl", 0)))
             side = position.get("side") or position.get("positionSide") or position.get("position_side")
-            leverage = float(position.get("leverage", 20))
+            leverage = _coerce_positive_float(position.get("leverage"), 20.0)
             initial_margin = safe_decimal(position.get("initialMargin", position.get("initial_margin", 0)))
 
             roe = 0.0

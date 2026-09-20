@@ -123,6 +123,42 @@ async def test_global_algo_scan_only_returns_trendmaster_managed_symbols() -> No
 
 
 @pytest.mark.asyncio
+async def test_smart_order_rejects_notional_that_falls_below_minimum_after_precision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeExchange:
+        async def fetch_ticker(self, symbol: str):
+            return {"last": 80469.3}
+
+        @staticmethod
+        def amount_to_precision(symbol: str, amount: float) -> str:
+            return "0.0006"
+
+        @staticmethod
+        def price_to_precision(symbol: str, price: float) -> str:
+            return str(price)
+
+    async def noop_init() -> None:
+        return None
+
+    async def allow_risk(*args, **kwargs):
+        return True, "Success"
+
+    monkeypatch.setattr(execution_server.engine, "ex", FakeExchange())
+    monkeypatch.setattr(execution_server.engine, "init_exchange", noop_init)
+    monkeypatch.setattr(execution_server.engine, "validate_risk", allow_risk)
+    monkeypatch.setitem(execution_server.RISK_CONFIG, "DRY_RUN_MODE", True)
+    monkeypatch.setitem(execution_server.RISK_CONFIG, "MIN_ORDER_NOTIONAL_USD", execution_server.Decimal("50"))
+
+    raw = await execution_server.execute_smart_order("BTC/USDT", "buy", 55.0)
+    result = execution_server.json.loads(raw)
+
+    assert result["status"] == "rejected"
+    assert result["error_code"] == "MIN_NOTIONAL_AFTER_PRECISION"
+    assert "48.2816" in result["message"]
+
+
+@pytest.mark.asyncio
 async def test_unprotected_entry_rollback_closes_only_the_new_fill(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = execution_server.ExecutionEngine()
     cancelled: list[tuple[str, str]] = []

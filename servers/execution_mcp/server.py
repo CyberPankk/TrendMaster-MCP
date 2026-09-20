@@ -235,6 +235,7 @@ RISK_CONFIG = {
     "MAX_POSITION_USD": Decimal(os.getenv("MAX_POSITION_USD", "2000")),
     "MAX_TWAP_TOTAL_USD": Decimal(os.getenv("MAX_TWAP_TOTAL_USD", "1000")),
     "MAX_SPREAD_PCT": Decimal(os.getenv("MAX_SPREAD_PCT", "0.005")),
+    "MIN_ORDER_NOTIONAL_USD": Decimal(os.getenv("MIN_ORDER_NOTIONAL_USD", "50")),
     "VOLATILITY_THRESHOLD": Decimal("0.02"), # 波动率阈值 (2%)，超过则禁止市价单
     "DRY_RUN_MODE": _env_flag("DRY_RUN_MODE", True),
     "RISK_CHECK_FAIL_OPEN": _env_flag("RISK_CHECK_FAIL_OPEN", False),
@@ -2443,6 +2444,18 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
         amount_str = engine.ex.amount_to_precision(symbol, float(amount_dec))
         price_str = engine.ex.price_to_precision(symbol, float(exec_price_dec)) if order_type == 'limit' else None
 
+        actual_notional_usd = safe_decimal(amount_str) * exec_price_dec
+        min_order_notional_usd = safe_decimal(RISK_CONFIG["MIN_ORDER_NOTIONAL_USD"])
+        if actual_notional_usd < min_order_notional_usd:
+            return MCPErrorResponse(
+                status="rejected",
+                error_code="MIN_NOTIONAL_AFTER_PRECISION",
+                message=(
+                    f"订单数量按交易所精度调整后名义金额仅 {actual_notional_usd:.4f} USDT，"
+                    f"低于最低 {min_order_notional_usd:.2f} USDT；请提高计划金额。"
+                ),
+            ).model_dump_json()
+
         logger.info(f"准备执行: {side.upper()} {symbol} {amount_str} @ {order_type} (Est. Price: {exec_price_dec})")
 
         # ---------------------------------------------------------
@@ -2490,7 +2503,11 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
             return MCPErrorResponse(status="error", error_code="INSUFFICIENT_FUNDS", message=str(e)).model_dump_json()
         except ccxt.InvalidOrder as e:
             logger.exception(f"❌ [CCXT 非法订单] {type(e).__name__}: {e}")
-            return MCPErrorResponse(status="error", error_code="INVALID_ORDER", message=str(e)).model_dump_json()
+            emsg = str(e)
+            emsg_lower = emsg.lower()
+            if ("notional" in emsg_lower and "no smaller than" in emsg_lower) or ("\"code\":-4164" in emsg_lower):
+                return MCPErrorResponse(status="rejected", error_code="MIN_NOTIONAL", message=emsg).model_dump_json()
+            return MCPErrorResponse(status="error", error_code="INVALID_ORDER", message=emsg).model_dump_json()
         except ccxt.ExchangeError as e:
             logger.exception(f"❌ [CCXT 交易所错误] {type(e).__name__}: {e}")
             emsg = str(e)

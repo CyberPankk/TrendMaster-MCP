@@ -159,6 +159,40 @@ async def test_smart_order_rejects_notional_that_falls_below_minimum_after_preci
 
 
 @pytest.mark.asyncio
+async def test_physical_entry_configures_exchange_leverage_before_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, str]] = []
+
+    class FakeExchange:
+        async def set_leverage(self, leverage: int, symbol: str):
+            calls.append((leverage, symbol))
+
+    monkeypatch.setattr(execution_server.engine, "ex", FakeExchange())
+    monkeypatch.setitem(execution_server.RISK_CONFIG, "DRY_RUN_MODE", False)
+    monkeypatch.setenv("STRATEGY_MAX_LEVERAGE", "3")
+
+    ok, reason = await execution_server._configure_entry_leverage("ETH/USDT", 3)
+
+    assert ok is True
+    assert reason == "configured"
+    assert calls == [(3, "ETH/USDT")]
+
+
+@pytest.mark.asyncio
+async def test_physical_entry_rejects_leverage_above_safety_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(execution_server.RISK_CONFIG, "DRY_RUN_MODE", False)
+    monkeypatch.setenv("STRATEGY_MAX_LEVERAGE", "3")
+
+    ok, reason = await execution_server._configure_entry_leverage("ETH/USDT", 20)
+
+    assert ok is False
+    assert "exceeds safety cap 3x" in reason
+
+
+@pytest.mark.asyncio
 async def test_unprotected_entry_rollback_closes_only_the_new_fill(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = execution_server.ExecutionEngine()
     cancelled: list[tuple[str, str]] = []

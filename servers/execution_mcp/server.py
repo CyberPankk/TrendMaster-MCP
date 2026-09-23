@@ -241,6 +241,27 @@ RISK_CONFIG = {
     "RISK_CHECK_FAIL_OPEN": _env_flag("RISK_CHECK_FAIL_OPEN", False),
 }
 
+
+async def _configure_entry_leverage(symbol: str, requested_leverage: float) -> tuple[bool, str]:
+    """Set the physical futures leverage before entry and fail closed on any mismatch."""
+    leverage = _coerce_positive_float(requested_leverage, 1.0)
+    max_leverage = _coerce_positive_float(os.getenv("STRATEGY_MAX_LEVERAGE", "3"), 3.0)
+    if leverage > max_leverage:
+        return False, f"requested leverage {leverage:g}x exceeds safety cap {max_leverage:g}x"
+    if RISK_CONFIG["DRY_RUN_MODE"]:
+        return True, "dry_run"
+
+    setter = getattr(engine.ex, "set_leverage", None)
+    if not callable(setter):
+        return False, "exchange adapter does not support set_leverage"
+    try:
+        await setter(int(leverage), symbol)
+        logger.info("✅ 交易所物理杠杆已锁定: symbol=%s leverage=%sx", symbol, int(leverage))
+        return True, "configured"
+    except Exception as exc:
+        logger.exception("交易所物理杠杆设置失败: symbol=%s leverage=%s", symbol, leverage)
+        return False, str(exc)
+
 if RISK_CONFIG["DRY_RUN_MODE"]:
     logger.warning("⚠️ 当前处于 模拟盘(DRY RUN) 模式")
 elif USE_TESTNET_MODE:
@@ -2277,7 +2298,7 @@ async def get_protection_snapshot(symbol: str) -> str:
         return MCPErrorResponse(status="error", error_code="PROTECTION_QUERY_FAILED", message=str(e)).model_dump_json()
 
 @mcp.tool()
-async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_type: str = 'market', price: float = None, sl_price: float = None, tp_price: float = None, volatility: float = 0.0) -> str:
+async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_type: str = 'market', price: float = None, sl_price: float = None, tp_price: float = None, volatility: float = 0.0, leverage: float = 3.0) -> str:
     """
     [Agent 专用工具] 执行带风控校验的智能下单指令。
     
@@ -2319,6 +2340,15 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
         if not is_safe:
             logger.warning(f"风控拦截 ({symbol}): {reason}")
             return MCPErrorResponse(status="rejected", error_code="RISK_CHECK_FAILED", message=reason).model_dump_json()
+
+        leverage_ok, leverage_reason = await _configure_entry_leverage(symbol, leverage)
+        if not leverage_ok:
+            logger.error("物理杠杆预检失败 (%s): %s", symbol, leverage_reason)
+            return MCPErrorResponse(
+                status="rejected",
+                error_code="LEVERAGE_CONFIGURATION_FAILED",
+                message=f"交易所杠杆未能安全设置，拒绝开仓: {leverage_reason}",
+            ).model_dump_json()
 
         if should_twap:
             effective_chunk_usd = min(engine.twap_chunk_size, RISK_CONFIG["MAX_ORDER_USD"], amount_usd_dec)

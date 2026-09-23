@@ -104,8 +104,8 @@ def build_exchange_config_candidates() -> list[tuple[str, dict[str, Any]]]:
 
 
 def get_indicator_engine_priority() -> list[str]:
-    """返回固定的 Indicator 路由策略：localhost HTTP 优先，超时后回退官方 SDK。"""
-    return ["local_httpx", "sdk"]
+    """返回 Indicator 路由策略：官方 REST 优先，失败后回退官方 SDK。"""
+    return [get_indicator_public_http_route_name(), "sdk"]
 
 
 def get_indicator_route_breaker_name(scope: str, route_name: str) -> str:
@@ -116,7 +116,12 @@ def get_indicator_route_breaker_name(scope: str, route_name: str) -> str:
 def get_indicator_data_source_label(route_name: str) -> str:
     """将 Indicator 路由名映射为统一的数据源日志标签。"""
     normalized_route = str(route_name).strip().lower()
-    if normalized_route.startswith("sdk_") or normalized_route in {"proxy", "direct", "sdk"}:
+    if normalized_route.startswith("sdk_") or normalized_route in {
+        "proxy",
+        "direct",
+        "sdk",
+        "official_httpx",
+    }:
         return "[Binance-Official-SDK]"
     return "[Hummingbot-Gateway]"
 
@@ -182,8 +187,14 @@ def get_public_rest_timeout_seconds() -> float:
 
 
 def get_indicator_local_gateway_base_url() -> str:
-    """返回 Indicator 本地 HTTP 网关地址，默认命中 localhost:8000。"""
-    return os.getenv("INDICATOR_LOCAL_GATEWAY_URL", "http://127.0.0.1:8000").strip().rstrip("/")
+    """返回 Indicator HTTP 行情地址；未显式配置本地网关时直接访问 Binance。"""
+    configured_url = os.getenv("INDICATOR_LOCAL_GATEWAY_URL", "").strip()
+    return (configured_url or get_binance_futures_rest_base_url()).rstrip("/")
+
+
+def get_indicator_public_http_route_name() -> str:
+    """区分显式本地网关与默认官方 REST，避免把容器 localhost 误判为网关。"""
+    return "local_httpx" if os.getenv("INDICATOR_LOCAL_GATEWAY_URL", "").strip() else "official_httpx"
 
 
 def get_kronos_local_timeout_seconds() -> float:
@@ -254,14 +265,14 @@ async def fetch_public_rest_json(
     path: str,
     params: dict[str, Any],
 ) -> tuple[Any, str]:
-    """优先访问 localhost:8000 本地 HTTP 网关，命中超时后交由上层回退官方 SDK。"""
-    route_name = "local_httpx"
+    """访问配置的 HTTP 行情源；默认直连 Binance，失败后由上层回退官方 SDK。"""
+    route_name = get_indicator_public_http_route_name()
     breaker_name = get_indicator_route_breaker_name("httpx", route_name)
     breaker = get_route_circuit_breaker(breaker_name)
     is_allowed, breaker_state = breaker.allow_request()
     if not is_allowed:
         raise RuntimeError(
-            f"Indicator 本地 HTTP 网关处于熔断跳过状态: {route_name}({breaker_state})"
+            f"Indicator HTTP 行情源处于熔断跳过状态: {route_name}({breaker_state})"
         )
 
     base_url = get_indicator_local_gateway_base_url()
@@ -278,7 +289,7 @@ async def fetch_public_rest_json(
             extra=f"url={request_url} timeout={timeout_seconds:.1f}s",
         )
         logger.info(
-            f"🎯 Indicator 命中本地 HTTP 优先链路: {request_url} timeout={timeout_seconds:.1f}s"
+            f"🎯 Indicator 命中 HTTP 优先链路: {request_url} timeout={timeout_seconds:.1f}s"
         )
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.get(request_url, params=params)
@@ -307,7 +318,9 @@ async def fetch_rest_ohlcv(
     timeframe: str,
     limit: int,
 ) -> tuple[list[list[float]], str]:
-    """优先通过 localhost HTTP 网关拉取 OHLCV，超时后回退官方 SDK。"""
+    """优先通过 HTTP 行情源拉取 OHLCV，超时后回退官方 SDK。"""
+
+    primary_route = get_indicator_public_http_route_name()
 
     async def _request(exchange: Any) -> list[list[float]]:
         """执行单次 OHLCV 请求。"""
@@ -336,12 +349,12 @@ async def fetch_rest_ohlcv(
         return normalized_ohlcv, route_name
     except httpx.TimeoutException as timeout_error:
         logger.warn(
-            f"[Hummingbot-Gateway] ⏱️ Indicator 本地 HTTP OHLCV 超时 ({get_public_rest_timeout_seconds():.1f}s)，"
+            f"{get_indicator_data_source_label(primary_route)} ⏱️ Indicator HTTP OHLCV 超时 ({get_public_rest_timeout_seconds():.1f}s)，"
             f"回退官方 SDK: {timeout_error}"
         )
     except Exception as local_http_error:
         logger.warn(
-            f"[Hummingbot-Gateway] ⚠️ Indicator 本地 HTTP OHLCV 失败，回退官方 SDK: {local_http_error}"
+            f"{get_indicator_data_source_label(primary_route)} ⚠️ Indicator HTTP OHLCV 失败，回退官方 SDK: {local_http_error}"
         )
 
     ohlcv, route_name = await execute_exchange_request(
@@ -354,7 +367,7 @@ async def fetch_rest_ohlcv(
             event="indicator_route_fallback",
             symbol=symbol,
             payload={
-                "from_route": "local_httpx",
+                "from_route": primary_route,
                 "to_route": f"sdk_{route_name}",
                 "reason": "timeout_or_local_http_failure",
             },
@@ -367,7 +380,9 @@ async def fetch_rest_market_snapshot(
     symbol: str,
     timeframe: str,
 ) -> tuple[list[list[float]], dict[str, Any], dict[str, Any], list[dict[str, Any]], str]:
-    """优先通过 localhost HTTP 网关拉取完整快照，超时后回退官方 SDK。"""
+    """优先通过 HTTP 行情源拉取完整快照，超时后回退官方 SDK。"""
+
+    primary_route = get_indicator_public_http_route_name()
 
     async def _request(exchange: Any) -> tuple[
         list[list[float]],
@@ -453,12 +468,12 @@ async def fetch_rest_market_snapshot(
         )
     except httpx.TimeoutException as timeout_error:
         logger.warn(
-            f"[Hummingbot-Gateway] ⏱️ Indicator 本地 HTTP 市场快照超时 ({get_public_rest_timeout_seconds():.1f}s)，"
+            f"{get_indicator_data_source_label(primary_route)} ⏱️ Indicator HTTP 市场快照超时 ({get_public_rest_timeout_seconds():.1f}s)，"
             f"回退官方 SDK: {timeout_error}"
         )
     except Exception as local_http_error:
         logger.warn(
-            f"[Hummingbot-Gateway] ⚠️ Indicator 本地 HTTP 市场快照失败，回退官方 SDK: {local_http_error}"
+            f"{get_indicator_data_source_label(primary_route)} ⚠️ Indicator HTTP 市场快照失败，回退官方 SDK: {local_http_error}"
         )
 
     market_snapshot, route_name = await execute_exchange_request(
@@ -472,7 +487,7 @@ async def fetch_rest_market_snapshot(
             event="indicator_route_fallback",
             symbol=symbol,
             payload={
-                "from_route": "local_httpx",
+                "from_route": primary_route,
                 "to_route": f"sdk_{route_name}",
                 "reason": "timeout_or_local_http_failure",
             },

@@ -82,6 +82,23 @@ def _coerce_positive_float(value: object, default: float) -> float:
         return float(default)
     return parsed if math.isfinite(parsed) and parsed > 0 else float(default)
 
+
+def _configured_leverage_fallback() -> float:
+    """Return the same leverage cap used when an entry is physically placed."""
+    return _coerce_positive_float(os.getenv("STRATEGY_MAX_LEVERAGE"), 3.0)
+
+
+def _position_leverage(position: dict) -> tuple[float, str]:
+    """Read exchange leverage without silently inventing the legacy 20x value."""
+    raw_value = position.get("leverage")
+    try:
+        parsed = float(raw_value)
+    except (TypeError, ValueError):
+        parsed = 0.0
+    if math.isfinite(parsed) and parsed > 0:
+        return parsed, "exchange"
+    return _configured_leverage_fallback(), "configured_fallback"
+
 def _get_twap_control_lock() -> asyncio.Lock:
     global TWAP_CONTROL_LOCK
     if TWAP_CONTROL_LOCK is None:
@@ -184,7 +201,8 @@ def _normalize_client_tag_symbol(symbol: str) -> str:
     """
     生成可用于 newClientOrderId 的稳定 symbol 标签，便于后续只撤销本系统创建的保护单。
     """
-    return symbol.replace("/", "").replace(":", "_").replace("-", "_").upper()
+    canonical = str(symbol or "").split(":", maxsplit=1)[0]
+    return canonical.replace("/", "").replace("-", "_").upper()
 
 def _extract_client_order_id(order: dict) -> str | None:
     """
@@ -197,7 +215,13 @@ def _extract_client_order_id(order: dict) -> str | None:
     info = order.get("info") if isinstance(order.get("info"), dict) else None
     if not isinstance(info, dict):
         return None
-    for key in ("clientOrderId", "origClientOrderId", "newClientOrderId"):
+    for key in (
+        "clientOrderId",
+        "origClientOrderId",
+        "newClientOrderId",
+        "clientAlgoId",
+        "newClientStrategyId",
+    ):
         val = info.get(key)
         if val:
             return str(val)
@@ -228,10 +252,32 @@ RISK_CONFIG = {
     "MAX_POSITION_USD": Decimal(os.getenv("MAX_POSITION_USD", "2000")),
     "MAX_TWAP_TOTAL_USD": Decimal(os.getenv("MAX_TWAP_TOTAL_USD", "1000")),
     "MAX_SPREAD_PCT": Decimal(os.getenv("MAX_SPREAD_PCT", "0.005")),
+    "MIN_ORDER_NOTIONAL_USD": Decimal(os.getenv("MIN_ORDER_NOTIONAL_USD", "50")),
     "VOLATILITY_THRESHOLD": Decimal("0.02"), # 波动率阈值 (2%)，超过则禁止市价单
     "DRY_RUN_MODE": _env_flag("DRY_RUN_MODE", True),
     "RISK_CHECK_FAIL_OPEN": _env_flag("RISK_CHECK_FAIL_OPEN", False),
 }
+
+
+async def _configure_entry_leverage(symbol: str, requested_leverage: float) -> tuple[bool, str]:
+    """Set the physical futures leverage before entry and fail closed on any mismatch."""
+    leverage = _coerce_positive_float(requested_leverage, 1.0)
+    max_leverage = _coerce_positive_float(os.getenv("STRATEGY_MAX_LEVERAGE", "3"), 3.0)
+    if leverage > max_leverage:
+        return False, f"requested leverage {leverage:g}x exceeds safety cap {max_leverage:g}x"
+    if RISK_CONFIG["DRY_RUN_MODE"]:
+        return True, "dry_run"
+
+    setter = getattr(engine.ex, "set_leverage", None)
+    if not callable(setter):
+        return False, "exchange adapter does not support set_leverage"
+    try:
+        await setter(int(leverage), symbol)
+        logger.info("✅ 交易所物理杠杆已锁定: symbol=%s leverage=%sx", symbol, int(leverage))
+        return True, "configured"
+    except Exception as exc:
+        logger.exception("交易所物理杠杆设置失败: symbol=%s leverage=%s", symbol, leverage)
+        return False, str(exc)
 
 if RISK_CONFIG["DRY_RUN_MODE"]:
     logger.warning("⚠️ 当前处于 模拟盘(DRY RUN) 模式")
@@ -399,12 +445,29 @@ class ExecutionEngine:
         await self.init_exchange()
         candidates = self._build_symbol_candidates(symbol)
 
+        algo_query_succeeded = False
+        algo_query_errors: list[str] = []
         for candidate in candidates:
             try:
-                orders = await self.ex.fetch_open_orders(candidate)
+                orders = list(await self.ex.fetch_open_orders(candidate) or [])
             except Exception as exc:
                 logger.warning(f"按候选 symbol 查询挂单失败: requested={symbol} candidate={candidate} error={exc}")
-                continue
+                orders = []
+
+            # Binance USD-M 于 2026 年将 STOP/TAKE_PROFIT 条件单迁移到 Algo
+            # Order 接口；CCXT 的 fetch_open_orders 只返回普通订单。两类订单必须合并，
+            # 否则已存在的止损会被误判为缺失，残留条件单也无法被清理。
+            try:
+                orders.extend(await self._fetch_open_algo_orders(candidate))
+                algo_query_succeeded = True
+            except Exception as exc:
+                algo_query_errors.append(f"{candidate}: {exc}")
+                logger.warning(
+                    "查询 Binance Algo 条件单失败: requested=%s candidate=%s error=%s",
+                    symbol,
+                    candidate,
+                    exc,
+                )
 
             matched_orders = [
                 order
@@ -417,12 +480,205 @@ class ExecutionEngine:
                     logger.info(f"挂单 symbol 解析映射: requested={symbol} resolved={resolved_symbol}")
                 return matched_orders, resolved_symbol
 
+        if not algo_query_succeeded:
+            raise RuntimeError(
+                "Binance Algo 条件单查询全部失败，拒绝把保护状态误报为空: "
+                + " | ".join(algo_query_errors)
+            )
+
         fallback_symbol = candidates[0] if candidates else str(symbol or "").strip()
         logger.warning(
             "未按候选 symbol 查询到挂单，跳过无 symbol 全量扫描以避免 Binance Futures 356 秒限频: "
             f"requested={symbol} fallback={fallback_symbol}"
         )
         return [], fallback_symbol
+
+    async def _fetch_open_algo_orders(self, symbol: str) -> list[dict]:
+        """查询并标准化 Binance USD-M Algo 条件单。"""
+        raw_symbol = self.ex.market_id(symbol)
+        params = {"symbol": raw_symbol}
+        fetcher = getattr(self.ex, "fapiPrivateGetOpenAlgoOrders", None)
+        if callable(fetcher):
+            response = await fetcher(params)
+        else:
+            response = await self.ex.request("openAlgoOrders", "fapiPrivate", "GET", params)
+
+        rows = response.get("orders") if isinstance(response, dict) else response
+        normalized: list[dict] = []
+        for raw in rows or []:
+            if not isinstance(raw, dict):
+                continue
+            info = dict(raw)
+            algo_id = raw.get("algoId") or raw.get("strategyId") or raw.get("orderId")
+            client_id = raw.get("clientAlgoId") or raw.get("newClientStrategyId") or raw.get("clientOrderId")
+            order_type = raw.get("orderType") or raw.get("strategyType") or raw.get("type")
+            trigger_price = raw.get("triggerPrice") or raw.get("stopPrice")
+            quantity = raw.get("quantity") or raw.get("origQty")
+            info["_trendmaster_algo_order"] = True
+            info.setdefault("clientOrderId", client_id)
+            info.setdefault("stopPrice", trigger_price)
+            normalized.append(
+                {
+                    "id": str(algo_id) if algo_id is not None else None,
+                    "clientOrderId": str(client_id) if client_id else None,
+                    "symbol": symbol,
+                    "type": order_type,
+                    "side": str(raw.get("side") or "").lower(),
+                    "amount": quantity,
+                    "stopPrice": trigger_price,
+                    "reduceOnly": raw.get("reduceOnly"),
+                    "status": raw.get("algoStatus") or raw.get("strategyStatus") or raw.get("status"),
+                    "info": info,
+                }
+            )
+        return normalized
+
+    async def _cancel_algo_order(self, symbol: str, order: dict) -> None:
+        """按 Algo ID 撤销 Binance USD-M 条件单。"""
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        params = {"symbol": self.ex.market_id(symbol)}
+        algo_id = order.get("id") or info.get("algoId") or info.get("strategyId")
+        client_id = _extract_client_order_id(order)
+        if algo_id:
+            params["algoId"] = algo_id
+        elif client_id:
+            params["clientAlgoId"] = client_id
+        else:
+            raise ValueError("Algo order is missing algoId/clientAlgoId")
+
+        canceler = getattr(self.ex, "fapiPrivateDeleteAlgoOrder", None)
+        if callable(canceler):
+            await canceler(params)
+        else:
+            await self.ex.request("algoOrder", "fapiPrivate", "DELETE", params)
+
+    async def _cancel_order_by_kind(self, symbol: str, order: dict) -> None:
+        """Cancel either a regular CCXT order or a Binance Algo conditional order."""
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        if info.get("_trendmaster_algo_order"):
+            await self._cancel_algo_order(symbol, order)
+            return
+        order_id = order.get("id")
+        if not order_id:
+            raise ValueError("Order is missing id")
+        await self.ex.cancel_order(order_id, symbol)
+
+    async def _resolve_authoritative_fill(
+        self,
+        symbol: str,
+        order: dict,
+        requested_amount: str,
+    ) -> dict:
+        """Reconcile a market fill from user trades before exposing an entry price."""
+        order_id = str(order.get("id") or "")
+        fallback_qty = safe_decimal(order.get("filled") or requested_amount)
+        fallback_price = safe_decimal(order.get("average") or order.get("price") or 0)
+        fallback_fee = safe_decimal(
+            (order.get("fee") or {}).get("cost") if isinstance(order.get("fee"), dict) else 0
+        )
+        refreshed_order: dict = order
+
+        attempts = max(1, int(os.getenv("FILL_RECONCILE_ATTEMPTS", "4") or 4))
+        delay_sec = max(0.0, float(os.getenv("FILL_RECONCILE_DELAY_SEC", "0.15") or 0.15))
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            if order_id:
+                try:
+                    candidate = await self.ex.fetch_order(order_id, symbol)
+                    if isinstance(candidate, dict):
+                        refreshed_order = candidate
+                        fallback_qty = safe_decimal(candidate.get("filled") or fallback_qty)
+                        fallback_price = safe_decimal(candidate.get("average") or fallback_price)
+                        if isinstance(candidate.get("fee"), dict):
+                            fallback_fee = safe_decimal(candidate["fee"].get("cost") or fallback_fee)
+                except Exception as exc:
+                    last_error = str(exc)
+
+                try:
+                    trades = await self.ex.fetch_my_trades(symbol, None, 100, {"orderId": order_id})
+                    matched = [
+                        trade
+                        for trade in (trades or [])
+                        if str(trade.get("order") or trade.get("orderId") or "") == order_id
+                    ]
+                    filled_qty = sum((safe_decimal(trade.get("amount")) for trade in matched), Decimal("0"))
+                    filled_cost = sum((safe_decimal(trade.get("cost")) for trade in matched), Decimal("0"))
+                    if filled_qty > 0 and filled_cost > 0:
+                        total_fee = sum(
+                            (
+                                safe_decimal((trade.get("fee") or {}).get("cost"))
+                                if isinstance(trade.get("fee"), dict)
+                                else Decimal("0")
+                                for trade in matched
+                            ),
+                            Decimal("0"),
+                        )
+                        return {
+                            "filled_qty": filled_qty,
+                            "average_price": filled_cost / filled_qty,
+                            "fee": total_fee,
+                            "source": "user_trades",
+                        }
+                except Exception as exc:
+                    last_error = str(exc)
+
+            if attempt < attempts:
+                await asyncio.sleep(delay_sec)
+
+        if fallback_qty > 0 and fallback_price > 0 and str(refreshed_order.get("status") or "").lower() in {
+            "closed",
+            "filled",
+        }:
+            return {
+                "filled_qty": fallback_qty,
+                "average_price": fallback_price,
+                "fee": fallback_fee,
+                "source": "fetch_order",
+            }
+
+        logger.warning(
+            "成交回报未能完全校准，使用下单响应兜底: symbol=%s order_id=%s error=%s",
+            symbol,
+            order_id,
+            last_error,
+        )
+        return {
+            "filled_qty": fallback_qty,
+            "average_price": fallback_price,
+            "fee": fallback_fee,
+            "source": "create_order_fallback",
+        }
+
+    async def _fetch_managed_algo_order_symbols(self) -> set[str]:
+        """只返回本系统创建的 TM_SL_/TM_TP_ 条件单所属 symbol。"""
+        fetcher = getattr(self.ex, "fapiPrivateGetOpenAlgoOrders", None)
+        if callable(fetcher):
+            response = await fetcher({})
+        else:
+            response = await self.ex.request("openAlgoOrders", "fapiPrivate", "GET", {})
+
+        rows = response.get("orders") if isinstance(response, dict) else response
+        symbols: set[str] = set()
+        for raw in rows or []:
+            if not isinstance(raw, dict):
+                continue
+            client_id = str(
+                raw.get("clientAlgoId")
+                or raw.get("newClientStrategyId")
+                or raw.get("clientOrderId")
+                or ""
+            )
+            if not client_id.startswith(("TM_SL_", "TM_TP_")):
+                continue
+            raw_symbol = str(raw.get("symbol") or "").strip()
+            if not raw_symbol:
+                continue
+            try:
+                unified_symbol = self.ex.safe_symbol(raw_symbol, None, None, "contract")
+            except Exception:
+                unified_symbol = raw_symbol
+            symbols.add(str(unified_symbol or raw_symbol))
+        return symbols
 
     def _resolve_close_side_for_protection(self, position: dict, position_side: str) -> str | None:
         """
@@ -1298,17 +1554,31 @@ class ExecutionEngine:
             if candidate not in target_symbols:
                 target_symbols.append(candidate)
 
+        cancel_errors: list[str] = []
+        for order in open_orders:
+            info = order.get("info") if isinstance(order.get("info"), dict) else {}
+            if not info.get("_trendmaster_algo_order"):
+                continue
+            try:
+                await self._cancel_algo_order(resolved_symbol, order)
+            except Exception as exc:
+                cancel_errors.append(f"algo:{order.get('id')}:{exc}")
+
         last_exc: Exception | None = None
+        normal_cancel_succeeded = False
         for candidate in target_symbols:
             try:
                 await self.ex.cancel_all_orders(candidate)
                 if candidate != symbol:
                     logger.info(f"撤单 symbol 解析映射: requested={symbol} resolved={candidate}")
-                return
+                normal_cancel_succeeded = True
+                break
             except Exception as exc:
                 last_exc = exc
 
-        if open_orders and last_exc is not None:
+        if cancel_errors:
+            raise RuntimeError("撤销 Binance Algo 条件单失败: " + " | ".join(cancel_errors))
+        if open_orders and not normal_cancel_succeeded and last_exc is not None:
             raise last_exc
 
     def _extract_position_side_param(self, position: dict) -> str | None:
@@ -1593,11 +1863,64 @@ class ExecutionEngine:
             if not order_id:
                 continue
             try:
-                await self.ex.cancel_order(order_id, resolved_symbol)
+                if bool(info.get("_trendmaster_algo_order")):
+                    await self._cancel_algo_order(resolved_symbol, order)
+                else:
+                    await self.ex.cancel_order(order_id, resolved_symbol)
                 cancelled += 1
             except Exception as exc:
                 logger.warning(f"取消保护单失败 {resolved_symbol} order_id={order_id}: {exc}")
         return cancelled
+
+    async def _rollback_unprotected_entry(
+        self,
+        symbol: str,
+        entry_side: str,
+        filled_amount: str,
+        created_protection_orders: list[dict],
+    ) -> dict:
+        """仅撤销本次入场创建的保护单，并立即只减仓回滚本次成交。"""
+        cancelled_ids: list[str] = []
+        cancel_errors: list[str] = []
+        for protection_order in created_protection_orders:
+            order_id = protection_order.get("id")
+            if not order_id:
+                continue
+            try:
+                await self.ex.cancel_order(order_id, symbol)
+                cancelled_ids.append(str(order_id))
+                continue
+            except Exception as standard_exc:
+                try:
+                    await self._cancel_algo_order(symbol, protection_order)
+                    cancelled_ids.append(str(order_id))
+                    continue
+                except Exception as algo_exc:
+                    cancel_errors.append(f"{order_id}: standard={standard_exc}; algo={algo_exc}")
+
+        close_side = "buy" if str(entry_side).lower() == "sell" else "sell"
+        try:
+            close_order, close_mode = await self._submit_market_close_order(
+                symbol=symbol,
+                close_side=close_side,
+                amount_str=str(filled_amount),
+                position_side=None,
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": str(exc),
+                "cancelled_protection_order_ids": cancelled_ids,
+                "cancel_errors": cancel_errors,
+            }
+
+        return {
+            "status": "success" if not cancel_errors else "cleanup_incomplete",
+            "close_order_id": close_order.get("id"),
+            "close_mode": close_mode,
+            "cancelled_protection_order_ids": cancelled_ids,
+            "cancel_errors": cancel_errors,
+        }
 
     async def _close_position_with_fallback(self, symbol: str, position: dict) -> dict:
         """
@@ -1970,7 +2293,7 @@ async def get_position_snapshot(symbol: str) -> str:
         unrealized_pnl = safe_decimal(position.get("unrealizedPnl", position.get("unrealized_pnl", 0)))
         side = position.get("side") or position.get("positionSide") or position.get("position_side")
         normalized_side = engine._extract_position_direction(position)
-        leverage = _coerce_positive_float(position.get("leverage"), 20.0)
+        leverage, leverage_source = _position_leverage(position)
         initial_margin = safe_decimal(position.get("initialMargin", position.get("initial_margin", 0)))
         
         roe = 0.0
@@ -1990,6 +2313,7 @@ async def get_position_snapshot(symbol: str) -> str:
             "mark_price": float(mark_price),
             "unrealized_pnl": float(unrealized_pnl),
             "leverage": leverage,
+            "leverage_source": leverage_source,
             "roe": roe
         }
 
@@ -2017,7 +2341,7 @@ async def get_all_position_snapshots() -> str:
             mark_price = safe_decimal(position.get("markPrice", position.get("mark_price", 0)))
             unrealized_pnl = safe_decimal(position.get("unrealizedPnl", position.get("unrealized_pnl", 0)))
             side = position.get("side") or position.get("positionSide") or position.get("position_side")
-            leverage = _coerce_positive_float(position.get("leverage"), 20.0)
+            leverage, leverage_source = _position_leverage(position)
             initial_margin = safe_decimal(position.get("initialMargin", position.get("initial_margin", 0)))
 
             roe = 0.0
@@ -2037,6 +2361,7 @@ async def get_all_position_snapshots() -> str:
                     "mark_price": float(mark_price),
                     "unrealized_pnl": float(unrealized_pnl),
                     "leverage": leverage,
+                    "leverage_source": leverage_source,
                     "roe": roe,
                 }
             )
@@ -2103,7 +2428,7 @@ async def get_protection_snapshot(symbol: str) -> str:
         return MCPErrorResponse(status="error", error_code="PROTECTION_QUERY_FAILED", message=str(e)).model_dump_json()
 
 @mcp.tool()
-async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_type: str = 'market', price: float = None, sl_price: float = None, tp_price: float = None, volatility: float = 0.0) -> str:
+async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_type: str = 'market', price: float = None, sl_price: float = None, tp_price: float = None, volatility: float = 0.0, leverage: float = 3.0) -> str:
     """
     [Agent 专用工具] 执行带风控校验的智能下单指令。
     
@@ -2145,6 +2470,15 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
         if not is_safe:
             logger.warning(f"风控拦截 ({symbol}): {reason}")
             return MCPErrorResponse(status="rejected", error_code="RISK_CHECK_FAILED", message=reason).model_dump_json()
+
+        leverage_ok, leverage_reason = await _configure_entry_leverage(symbol, leverage)
+        if not leverage_ok:
+            logger.error("物理杠杆预检失败 (%s): %s", symbol, leverage_reason)
+            return MCPErrorResponse(
+                status="rejected",
+                error_code="LEVERAGE_CONFIGURATION_FAILED",
+                message=f"交易所杠杆未能安全设置，拒绝开仓: {leverage_reason}",
+            ).model_dump_json()
 
         if should_twap:
             effective_chunk_usd = min(engine.twap_chunk_size, RISK_CONFIG["MAX_ORDER_USD"], amount_usd_dec)
@@ -2270,6 +2604,18 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
         amount_str = engine.ex.amount_to_precision(symbol, float(amount_dec))
         price_str = engine.ex.price_to_precision(symbol, float(exec_price_dec)) if order_type == 'limit' else None
 
+        actual_notional_usd = safe_decimal(amount_str) * exec_price_dec
+        min_order_notional_usd = safe_decimal(RISK_CONFIG["MIN_ORDER_NOTIONAL_USD"])
+        if actual_notional_usd < min_order_notional_usd:
+            return MCPErrorResponse(
+                status="rejected",
+                error_code="MIN_NOTIONAL_AFTER_PRECISION",
+                message=(
+                    f"订单数量按交易所精度调整后名义金额仅 {actual_notional_usd:.4f} USDT，"
+                    f"低于最低 {min_order_notional_usd:.2f} USDT；请提高计划金额。"
+                ),
+            ).model_dump_json()
+
         logger.info(f"准备执行: {side.upper()} {symbol} {amount_str} @ {order_type} (Est. Price: {exec_price_dec})")
 
         # ---------------------------------------------------------
@@ -2317,7 +2663,11 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
             return MCPErrorResponse(status="error", error_code="INSUFFICIENT_FUNDS", message=str(e)).model_dump_json()
         except ccxt.InvalidOrder as e:
             logger.exception(f"❌ [CCXT 非法订单] {type(e).__name__}: {e}")
-            return MCPErrorResponse(status="error", error_code="INVALID_ORDER", message=str(e)).model_dump_json()
+            emsg = str(e)
+            emsg_lower = emsg.lower()
+            if ("notional" in emsg_lower and "no smaller than" in emsg_lower) or ("\"code\":-4164" in emsg_lower):
+                return MCPErrorResponse(status="rejected", error_code="MIN_NOTIONAL", message=emsg).model_dump_json()
+            return MCPErrorResponse(status="error", error_code="INVALID_ORDER", message=emsg).model_dump_json()
         except ccxt.ExchangeError as e:
             logger.exception(f"❌ [CCXT 交易所错误] {type(e).__name__}: {e}")
             emsg = str(e)
@@ -2333,18 +2683,29 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
             return MCPErrorResponse(status="error", error_code="CREATE_ORDER_FAILED", message=str(e)).model_dump_json()
             
         logger.info(f"主订单物理下单成功: ID={order['id']}, Status={order['status']}")
+
+        reconciled_fill = await engine._resolve_authoritative_fill(symbol, order, amount_str)
+        filled_qty_dec = safe_decimal(reconciled_fill.get("filled_qty") or amount_str)
+        average_price_dec = safe_decimal(reconciled_fill.get("average_price") or exec_price_dec)
+        filled_amount_str = engine.ex.amount_to_precision(symbol, float(filled_qty_dec))
+        logger.info(
+            "主订单成交校准完成: ID=%s qty=%s avg=%s source=%s",
+            order.get("id"),
+            filled_amount_str,
+            average_price_dec,
+            reconciled_fill.get("source"),
+        )
         
         # 主动清空余额缓存，确保下一次查询是最新数据
         balance_cache.clear()
         execution_breaker.record_success() # 成功发单，重置熔断器
         logger.info("♻️ 订单已执行，已主动清空本地资产缓存。")
         
-        fee = 0.0
-        if isinstance(order.get("fee"), dict):
-            fee = float(order["fee"].get("cost") or 0.0)
+        fee = float(safe_decimal(reconciled_fill.get("fee") or 0))
 
         protection_pending = False
         protection_messages: list[str] = []
+        created_protection_orders: list[dict] = []
 
         sl_order_id = None
         if sl_price:
@@ -2361,7 +2722,7 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                         symbol=symbol,
                         type="STOP_MARKET",
                         side="buy" if side == "sell" else "sell",
-                        amount=float(amount_str),
+                        amount=float(filled_amount_str),
                         params={
                             "stopPrice": float(sl_price_str),
                             "reduceOnly": True,
@@ -2369,6 +2730,7 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                         },
                     )
                     sl_order_id = sl_order.get("id")
+                    created_protection_orders.append(sl_order)
                     logger.info(f"止损单设置成功: ID={sl_order_id} @ {sl_price_str}")
                     last_exc = None
                     break
@@ -2380,22 +2742,8 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
 
             if last_exc is not None and not sl_order_id:
                 logger.exception(f"止损单设置失败 (主单已成): {str(last_exc)}")
-                retry_attempts = int(os.getenv("PROTECTION_SL_BACKGROUND_RETRY", "20") or 20)
-                retry_delay_sec = float(os.getenv("PROTECTION_SL_BACKGROUND_DELAY_SEC", "1.0") or 1.0)
-                close_side = "buy" if side == "sell" else "sell"
-                asyncio.create_task(
-                    engine._retry_create_stop_loss(
-                        symbol=symbol,
-                        close_side=close_side,
-                        amount_str=str(amount_str),
-                        sl_price=float(sl_price),
-                        tag_prefix=sl_tag_prefix,
-                        max_attempts=retry_attempts,
-                        delay_sec=retry_delay_sec,
-                    )
-                )
                 protection_pending = True
-                protection_messages.append(f"止损单创建失败，已进入后台重试: {str(last_exc)}")
+                protection_messages.append(f"止损单创建失败: {str(last_exc)}")
 
         tp_order_id = None
         if tp_price:
@@ -2413,7 +2761,7 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                         symbol=symbol,
                         type="TAKE_PROFIT_MARKET",
                         side=close_side,
-                        amount=float(amount_str),
+                        amount=float(filled_amount_str),
                         params={
                             "stopPrice": float(tp_price_str),
                             "reduceOnly": True,
@@ -2421,6 +2769,7 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                         },
                     )
                     tp_order_id = tp_order.get("id")
+                    created_protection_orders.append(tp_order)
                     logger.info(f"止盈单设置成功: ID={tp_order_id} @ {tp_price_str}")
                     last_exc = None
                     break
@@ -2431,34 +2780,53 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
                         await asyncio.sleep(tp_retry_delay_sec)
 
             if last_exc is not None and not tp_order_id:
-                retry_attempts = int(os.getenv("PROTECTION_TP_BACKGROUND_RETRY", "10") or 10)
-                retry_delay_sec = float(os.getenv("PROTECTION_TP_BACKGROUND_DELAY_SEC", "1.0") or 1.0)
-                asyncio.create_task(
-                    engine._retry_create_take_profit(
-                        symbol=symbol,
-                        close_side=close_side,
-                        amount_str=str(amount_str),
-                        tp_price=float(tp_price),
-                        tag_prefix=tp_tag_prefix,
-                        max_attempts=retry_attempts,
-                        delay_sec=retry_delay_sec,
-                    )
-                )
                 protection_pending = True
-                protection_messages.append(f"止盈单创建失败，已进入后台重试: {str(last_exc)}")
+                protection_messages.append(f"止盈单创建失败: {str(last_exc)}")
 
-        status = "partial_success" if protection_pending else "success"
-        message = " ; ".join(protection_messages) if protection_messages else None
+        if protection_pending:
+            rollback_amount = filled_amount_str
+            rollback = await engine._rollback_unprotected_entry(
+                symbol=symbol,
+                entry_side=side,
+                filled_amount=str(rollback_amount),
+                created_protection_orders=created_protection_orders,
+            )
+            rollback_ok = rollback.get("status") == "success"
+            logger.error(
+                "原子入场保护不完整，已%s回滚主订单: symbol=%s order_id=%s detail=%s",
+                "完成" if rollback_ok else "尝试但未完成",
+                symbol,
+                order.get("id"),
+                rollback,
+            )
+            return json.dumps(
+                {
+                    "status": "rolled_back" if rollback_ok else "error",
+                    "error_code": "ATOMIC_PROTECTION_FAILED" if rollback_ok else "ATOMIC_ROLLBACK_FAILED",
+                    "execution_mode": "live",
+                    "order_id": order.get("id"),
+                    "sl_order_id": sl_order_id,
+                    "tp_order_id": tp_order_id,
+                    "message": " ; ".join(protection_messages),
+                    "rollback": rollback,
+                    "filled_qty": rollback_amount,
+                    "average_price": str(average_price_dec),
+                    "fill_source": reconciled_fill.get("source"),
+                    "fee": fee,
+                },
+                ensure_ascii=False,
+            )
 
         return json.dumps({
-            "status": status,
+            "status": "success",
             "execution_mode": "live",
             "order_id": order['id'],
             "sl_order_id": sl_order_id,
             "tp_order_id": tp_order_id,
-            "message": message,
-            "filled_qty": order.get('filled', amount_str),
-            "average_price": order.get('average', str(exec_price_dec)),
+            "message": None,
+            "filled_qty": filled_amount_str,
+            "average_price": str(average_price_dec),
+            "fill_source": reconciled_fill.get("source"),
             "fee": fee
         }, ensure_ascii=False)
 
@@ -2566,6 +2934,7 @@ async def update_stop_loss(symbol: str, position_side: str, sl_price: float) -> 
         new_order_id = sl_order.get("id")
 
         cancelled_order_ids: list[str] = []
+        cancellation_errors: list[str] = []
         try:
             open_orders, resolved_open_symbol = await engine._fetch_open_orders_for_symbol(execution_symbol)
         except Exception:
@@ -2586,16 +2955,18 @@ async def update_stop_loss(symbol: str, position_side: str, sl_price: float) -> 
             is_managed = bool(client_id and client_id.startswith(tag_prefix))
             if has_stop and reduce_only and is_managed and oid:
                 try:
-                    await engine.ex.cancel_order(oid, resolved_open_symbol)
+                    await engine._cancel_order_by_kind(resolved_open_symbol, o)
                     cancelled_order_ids.append(str(oid))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    cancellation_errors.append(f"{oid}: {exc}")
+                    logger.warning("旧止损单撤销失败: symbol=%s order_id=%s error=%s", execution_symbol, oid, exc)
 
         return json.dumps(
             {
                 "status": "success",
                 "message": f"止损单已更新: {execution_symbol} -> {sl_price_str}",
                 "cancelled_order_ids": cancelled_order_ids,
+                "cancellation_errors": cancellation_errors,
                 "sl_order_id": new_order_id,
                 "sl_price": sl_price_str,
                 "amount": amount_str,
@@ -2667,6 +3038,7 @@ async def update_take_profit(symbol: str, position_side: str, tp_price: float) -
         new_order_id = tp_order.get("id")
 
         cancelled_order_ids: list[str] = []
+        cancellation_errors: list[str] = []
         try:
             open_orders, resolved_open_symbol = await engine._fetch_open_orders_for_symbol(execution_symbol)
         except Exception:
@@ -2687,16 +3059,18 @@ async def update_take_profit(symbol: str, position_side: str, tp_price: float) -
             is_managed = bool(client_id and client_id.startswith(tag_prefix))
             if has_tp and reduce_only and is_managed and oid:
                 try:
-                    await engine.ex.cancel_order(oid, resolved_open_symbol)
+                    await engine._cancel_order_by_kind(resolved_open_symbol, o)
                     cancelled_order_ids.append(str(oid))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    cancellation_errors.append(f"{oid}: {exc}")
+                    logger.warning("旧止盈单撤销失败: symbol=%s order_id=%s error=%s", execution_symbol, oid, exc)
 
         return json.dumps(
             {
                 "status": "success",
                 "message": f"止盈单已更新: {execution_symbol} -> {tp_price_str}",
                 "cancelled_order_ids": cancelled_order_ids,
+                "cancellation_errors": cancellation_errors,
                 "tp_order_id": new_order_id,
                 "tp_price": tp_price_str,
                 "amount": amount_str,
@@ -2865,6 +3239,10 @@ async def kill_all_positions_global() -> str:
         logger.warning("🚨 收到全局清仓指令: GLOBAL")
 
         symbols = set()
+        try:
+            symbols.update(await engine._fetch_managed_algo_order_symbols())
+        except Exception as exc:
+            logger.error("全局熔断扫描受管 Algo 条件单失败: %s", exc)
         try:
             positions = await engine.ex.fetch_positions()
             for position in positions or []:

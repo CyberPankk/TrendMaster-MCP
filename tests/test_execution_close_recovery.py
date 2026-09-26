@@ -13,13 +13,280 @@ sys.path.insert(0, str(SERVER_DIR))
 import server as execution_server  # noqa: E402
 
 
-def test_nullable_leverage_uses_safe_default() -> None:
-    assert execution_server._coerce_positive_float(None, 20.0) == 20.0
-    assert execution_server._coerce_positive_float("", 20.0) == 20.0
-    assert execution_server._coerce_positive_float(0, 20.0) == 20.0
-    assert execution_server._coerce_positive_float(float("nan"), 20.0) == 20.0
-    assert execution_server._coerce_positive_float(float("inf"), 20.0) == 20.0
-    assert execution_server._coerce_positive_float("8", 20.0) == 8.0
+def test_nullable_leverage_uses_configured_safety_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STRATEGY_MAX_LEVERAGE", "3")
+
+    assert execution_server._position_leverage({"leverage": None}) == (3.0, "configured_fallback")
+    assert execution_server._position_leverage({"leverage": ""}) == (3.0, "configured_fallback")
+    assert execution_server._position_leverage({"leverage": 0}) == (3.0, "configured_fallback")
+    assert execution_server._position_leverage({"leverage": float("nan")}) == (3.0, "configured_fallback")
+    assert execution_server._position_leverage({"leverage": "8"}) == (8.0, "exchange")
+
+
+@pytest.mark.asyncio
+async def test_authoritative_fill_prefers_user_trades() -> None:
+    engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        async def fetch_order(self, order_id: str, symbol: str):
+            return {"id": order_id, "status": "closed", "filled": 0.5, "average": 100.0}
+
+        async def fetch_my_trades(self, symbol: str, since, limit: int, params: dict[str, object]):
+            assert params == {"orderId": "entry-1"}
+            return [
+                {"order": "entry-1", "amount": 0.2, "cost": 20.2, "fee": {"cost": 0.01}},
+                {"order": "entry-1", "amount": 0.3, "cost": 30.6, "fee": {"cost": 0.02}},
+            ]
+
+    engine.ex = FakeExchange()
+    fill = await engine._resolve_authoritative_fill(
+        "ETH/USDT",
+        {"id": "entry-1", "status": "closed", "filled": 0.5, "average": 99.0},
+        "0.5",
+    )
+
+    assert fill["source"] == "user_trades"
+    assert fill["filled_qty"] == execution_server.Decimal("0.5")
+    assert fill["average_price"] == execution_server.Decimal("101.6")
+    assert fill["fee"] == execution_server.Decimal("0.03")
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_by_kind_uses_algo_endpoint() -> None:
+    engine = execution_server.ExecutionEngine()
+    calls: list[dict[str, object]] = []
+
+    class FakeExchange:
+        @staticmethod
+        def market_id(symbol: str) -> str:
+            return "ETHUSDT"
+
+        async def fapiPrivateDeleteAlgoOrder(self, params: dict[str, object]):
+            calls.append(params)
+
+        async def cancel_order(self, order_id: str, symbol: str):
+            raise AssertionError("Algo orders must not use the normal cancel endpoint")
+
+    engine.ex = FakeExchange()
+    await engine._cancel_order_by_kind(
+        "ETH/USDT",
+        {"id": "123", "info": {"_trendmaster_algo_order": True, "algoId": "123"}},
+    )
+
+    assert calls == [{"symbol": "ETHUSDT", "algoId": "123"}]
+
+
+def test_client_tag_symbol_uses_same_identity_for_ccxt_future_suffix() -> None:
+    assert execution_server._normalize_client_tag_symbol("ETH/USDT") == "ETHUSDT"
+    assert execution_server._normalize_client_tag_symbol("ETH/USDT:USDT") == "ETHUSDT"
+
+
+@pytest.mark.asyncio
+async def test_open_order_lookup_merges_binance_algo_orders(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        async def fetch_open_orders(self, symbol: str):
+            return []
+
+        @staticmethod
+        def market_id(symbol: str) -> str:
+            return "ETHUSDT"
+
+        async def fapiPrivateGetOpenAlgoOrders(self, params: dict[str, object]):
+            assert params == {"symbol": "ETHUSDT"}
+            return [
+                {
+                    "algoId": 1000000210364943,
+                    "clientAlgoId": "TM_SL_ETHUSDT_1",
+                    "orderType": "STOP_MARKET",
+                    "algoStatus": "NEW",
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "quantity": "0.5",
+                    "triggerPrice": "2636.78",
+                    "reduceOnly": True,
+                }
+            ]
+
+    engine.ex = FakeExchange()
+
+    async def noop_init() -> None:
+        return None
+
+    monkeypatch.setattr(engine, "init_exchange", noop_init)
+    orders, resolved = await engine._fetch_open_orders_for_symbol("ETH/USDT")
+
+    assert resolved == "ETH/USDT"
+    assert len(orders) == 1
+    assert orders[0]["id"] == "1000000210364943"
+    assert orders[0]["clientOrderId"] == "TM_SL_ETHUSDT_1"
+    assert orders[0]["stopPrice"] == "2636.78"
+    assert orders[0]["info"]["_trendmaster_algo_order"] is True
+
+
+@pytest.mark.asyncio
+async def test_open_order_lookup_fails_closed_when_algo_query_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        async def fetch_open_orders(self, symbol: str):
+            return []
+
+        @staticmethod
+        def market_id(symbol: str) -> str:
+            return "ETHUSDT"
+
+        async def request(self, *args, **kwargs):
+            raise RuntimeError("algo endpoint unavailable")
+
+    engine.ex = FakeExchange()
+
+    async def noop_init() -> None:
+        return None
+
+    monkeypatch.setattr(engine, "init_exchange", noop_init)
+    with pytest.raises(RuntimeError, match="拒绝把保护状态误报为空"):
+        await engine._fetch_open_orders_for_symbol("ETH/USDT")
+
+
+@pytest.mark.asyncio
+async def test_global_algo_scan_only_returns_trendmaster_managed_symbols() -> None:
+    engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        async def fapiPrivateGetOpenAlgoOrders(self, params: dict[str, object]):
+            assert params == {}
+            return [
+                {"symbol": "ETHUSDT", "clientAlgoId": "TM_SL_ETHUSDT_1"},
+                {"symbol": "SOLUSDT", "clientAlgoId": "TM_TP_SOLUSDT_1"},
+                {"symbol": "BTCUSDT", "clientAlgoId": "manual-protection"},
+            ]
+
+        @staticmethod
+        def safe_symbol(symbol: str, *args) -> str:
+            return {"ETHUSDT": "ETH/USDT:USDT", "SOLUSDT": "SOL/USDT:USDT"}.get(symbol, symbol)
+
+    engine.ex = FakeExchange()
+
+    symbols = await engine._fetch_managed_algo_order_symbols()
+
+    assert symbols == {"ETH/USDT:USDT", "SOL/USDT:USDT"}
+
+
+@pytest.mark.asyncio
+async def test_smart_order_rejects_notional_that_falls_below_minimum_after_precision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeExchange:
+        async def fetch_ticker(self, symbol: str):
+            return {"last": 80469.3}
+
+        @staticmethod
+        def amount_to_precision(symbol: str, amount: float) -> str:
+            return "0.0006"
+
+        @staticmethod
+        def price_to_precision(symbol: str, price: float) -> str:
+            return str(price)
+
+    async def noop_init() -> None:
+        return None
+
+    async def allow_risk(*args, **kwargs):
+        return True, "Success"
+
+    monkeypatch.setattr(execution_server.engine, "ex", FakeExchange())
+    monkeypatch.setattr(execution_server.engine, "init_exchange", noop_init)
+    monkeypatch.setattr(execution_server.engine, "validate_risk", allow_risk)
+    monkeypatch.setitem(execution_server.RISK_CONFIG, "DRY_RUN_MODE", True)
+    monkeypatch.setitem(execution_server.RISK_CONFIG, "MIN_ORDER_NOTIONAL_USD", execution_server.Decimal("50"))
+
+    raw = await execution_server.execute_smart_order("BTC/USDT", "buy", 55.0)
+    result = execution_server.json.loads(raw)
+
+    assert result["status"] == "rejected"
+    assert result["error_code"] == "MIN_NOTIONAL_AFTER_PRECISION"
+    assert "48.2816" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_physical_entry_configures_exchange_leverage_before_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, str]] = []
+
+    class FakeExchange:
+        async def set_leverage(self, leverage: int, symbol: str):
+            calls.append((leverage, symbol))
+
+    monkeypatch.setattr(execution_server.engine, "ex", FakeExchange())
+    monkeypatch.setitem(execution_server.RISK_CONFIG, "DRY_RUN_MODE", False)
+    monkeypatch.setenv("STRATEGY_MAX_LEVERAGE", "3")
+
+    ok, reason = await execution_server._configure_entry_leverage("ETH/USDT", 3)
+
+    assert ok is True
+    assert reason == "configured"
+    assert calls == [(3, "ETH/USDT")]
+
+
+@pytest.mark.asyncio
+async def test_physical_entry_rejects_leverage_above_safety_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(execution_server.RISK_CONFIG, "DRY_RUN_MODE", False)
+    monkeypatch.setenv("STRATEGY_MAX_LEVERAGE", "3")
+
+    ok, reason = await execution_server._configure_entry_leverage("ETH/USDT", 20)
+
+    assert ok is False
+    assert "exceeds safety cap 3x" in reason
+
+
+@pytest.mark.asyncio
+async def test_unprotected_entry_rollback_closes_only_the_new_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = execution_server.ExecutionEngine()
+    cancelled: list[tuple[str, str]] = []
+    close_calls: list[dict[str, object]] = []
+
+    class FakeExchange:
+        async def cancel_order(self, order_id: str, symbol: str):
+            raise RuntimeError("normal order endpoint does not contain algo order")
+
+        @staticmethod
+        def market_id(symbol: str) -> str:
+            return "ETHUSDT"
+
+        async def fapiPrivateDeleteAlgoOrder(self, params: dict[str, object]):
+            cancelled.append((str(params["algoId"]), str(params["symbol"])))
+
+    async def fake_submit(**kwargs):
+        close_calls.append(kwargs)
+        return {"id": "rollback-close-1"}, "reduce_only"
+
+    engine.ex = FakeExchange()
+    monkeypatch.setattr(engine, "_submit_market_close_order", fake_submit)
+
+    result = await engine._rollback_unprotected_entry(
+        symbol="ETH/USDT",
+        entry_side="buy",
+        filled_amount="0.5",
+        created_protection_orders=[{"id": "1000000210364943", "info": {"algoId": 1000000210364943}}],
+    )
+
+    assert result["status"] == "success"
+    assert cancelled == [("1000000210364943", "ETHUSDT")]
+    assert close_calls == [
+        {
+            "symbol": "ETH/USDT",
+            "close_side": "sell",
+            "amount_str": "0.5",
+            "position_side": None,
+        }
+    ]
 
 
 def test_one_way_position_does_not_invent_hedge_side() -> None:

@@ -270,6 +270,12 @@ async def test_unprotected_entry_rollback_closes_only_the_new_fill(monkeypatch: 
     engine.ex = FakeExchange()
     monkeypatch.setattr(engine, "_submit_market_close_order", fake_submit)
 
+    async def zero_position(symbol: str) -> list[dict]:
+        assert symbol == "ETH/USDT"
+        return [{"symbol": "ETHUSDT", "positionSide": "BOTH", "positionAmt": "0"}]
+
+    monkeypatch.setattr(engine, "_fetch_binance_usdm_positions_direct", zero_position)
+
     result = await engine._rollback_unprotected_entry(
         symbol="ETH/USDT",
         entry_side="buy",
@@ -278,6 +284,7 @@ async def test_unprotected_entry_rollback_closes_only_the_new_fill(monkeypatch: 
     )
 
     assert result["status"] == "success"
+    assert result["position_verified_zero"] is True
     assert cancelled == [("1000000210364943", "ETHUSDT")]
     assert close_calls == [
         {
@@ -287,6 +294,116 @@ async def test_unprotected_entry_rollback_closes_only_the_new_fill(monkeypatch: 
             "position_side": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("positions", "expected_status"),
+    [
+        ([{"symbol": "ETHUSDT", "positionAmt": "0.2"}], "position_remaining"),
+        ([], "position_unknown"),
+        ([{"symbol": "ETHUSDT", "positionAmt": None}], "position_unknown"),
+    ],
+)
+async def test_atomic_rollback_never_reports_success_without_zero_position(
+    monkeypatch: pytest.MonkeyPatch, positions: list[dict], expected_status: str,
+) -> None:
+    engine = execution_server.ExecutionEngine()
+    close_calls = 0
+
+    async def fake_close(**kwargs):
+        nonlocal close_calls
+        close_calls += 1
+        return {"id": "close-1"}, "reduce_only"
+
+    async def fake_positions(symbol: str) -> list[dict]:
+        return positions
+
+    monkeypatch.setattr(engine, "_submit_market_close_order", fake_close)
+    monkeypatch.setattr(engine, "_fetch_binance_usdm_positions_direct", fake_positions)
+    result = await engine._rollback_unprotected_entry("ETH/USDT", "buy", "0.5", [])
+
+    assert result["status"] == expected_status
+    assert result["position_verified_zero"] is False
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_atomic_rollback_timeout_checks_position_without_second_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = execution_server.ExecutionEngine()
+    close_calls = 0
+
+    async def timed_out_close(**kwargs):
+        nonlocal close_calls
+        close_calls += 1
+        raise TimeoutError("close response timed out")
+
+    async def zero_position(symbol: str) -> list[dict]:
+        return [{"symbol": "ETHUSDT", "positionAmt": "0"}]
+
+    monkeypatch.setattr(engine, "_submit_market_close_order", timed_out_close)
+    monkeypatch.setattr(engine, "_fetch_binance_usdm_positions_direct", zero_position)
+    result = await engine._rollback_unprotected_entry("ETH/USDT", "buy", "0.5", [])
+
+    assert result["status"] == "success"
+    assert result["close_error"] == "close response timed out"
+    assert result["position_verified_zero"] is True
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_atomic_rollback_position_query_error_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = execution_server.ExecutionEngine()
+
+    async def fake_close(**kwargs):
+        return {"id": "close-1"}, "reduce_only"
+
+    async def failed_positions(symbol: str) -> list[dict]:
+        raise TimeoutError("positionRisk unavailable")
+
+    monkeypatch.setattr(engine, "_submit_market_close_order", fake_close)
+    monkeypatch.setattr(engine, "_fetch_binance_usdm_positions_direct", failed_positions)
+    result = await engine._rollback_unprotected_entry("ETH/USDT", "buy", "0.5", [])
+
+    assert result["status"] == "position_unknown"
+    assert result["verification_error"] == "positionRisk unavailable"
+    assert result["position_verified_zero"] is False
+
+
+@pytest.mark.asyncio
+async def test_atomic_rollback_cancel_failure_keeps_cleanup_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        async def cancel_order(self, order_id: str, symbol: str) -> None:
+            raise RuntimeError("normal cancel unavailable")
+
+    async def failed_algo_cancel(symbol: str, order: dict) -> None:
+        raise RuntimeError("algo cancel unavailable")
+
+    async def fake_close(**kwargs):
+        return {"id": "close-1"}, "reduce_only"
+
+    async def zero_position(symbol: str) -> list[dict]:
+        return [{"symbol": "ETHUSDT", "positionAmt": "0"}]
+
+    engine.ex = FakeExchange()
+    monkeypatch.setattr(engine, "_cancel_algo_order", failed_algo_cancel)
+    monkeypatch.setattr(engine, "_submit_market_close_order", fake_close)
+    monkeypatch.setattr(engine, "_fetch_binance_usdm_positions_direct", zero_position)
+    result = await engine._rollback_unprotected_entry(
+        "ETH/USDT", "buy", "0.5", [{"id": "stop-1"}],
+    )
+
+    assert result["status"] == "cleanup_incomplete"
+    assert result["position_verified_zero"] is True
+    assert len(result["cancel_errors"]) == 1
 
 
 def test_one_way_position_does_not_invent_hedge_side() -> None:

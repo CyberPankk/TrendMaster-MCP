@@ -1899,6 +1899,9 @@ class ExecutionEngine:
                     cancel_errors.append(f"{order_id}: standard={standard_exc}; algo={algo_exc}")
 
         close_side = "buy" if str(entry_side).lower() == "sell" else "sell"
+        close_order: dict = {}
+        close_mode: str | None = None
+        close_error: str | None = None
         try:
             close_order, close_mode = await self._submit_market_close_order(
                 symbol=symbol,
@@ -1907,17 +1910,75 @@ class ExecutionEngine:
                 position_side=None,
             )
         except Exception as exc:
-            return {
-                "status": "error",
-                "message": str(exc),
-                "cancelled_protection_order_ids": cancelled_ids,
-                "cancel_errors": cancel_errors,
-            }
+            # A timeout can occur after the exchange accepted the order. Inspect the
+            # position before any caller considers a retry, to avoid a second close.
+            close_error = str(exc)
+
+        remaining_positions: list[dict] = []
+        verification_error: str | None = None
+        try:
+            if self.exchange_id == "binanceusdm":
+                positions = await self._fetch_binance_usdm_positions_direct(symbol)
+                matching = [
+                    pos for pos in positions
+                    if self._symbol_matches(str(pos.get("symbol") or ""), symbol)
+                ]
+                if not matching:
+                    raise RuntimeError("positionRisk did not return the requested symbol")
+                for pos in matching:
+                    raw_amount = pos.get("positionAmt")
+                    if raw_amount is None or not Decimal(str(raw_amount)).is_finite():
+                        raise RuntimeError("positionRisk returned an invalid positionAmt")
+                remaining_positions = [
+                    {
+                        "symbol": str(pos.get("symbol") or symbol),
+                        "position_side": str(pos.get("positionSide") or "BOTH"),
+                        "amount": str(pos.get("positionAmt", "unknown")),
+                    }
+                    for pos in matching
+                    if abs(safe_decimal(pos.get("positionAmt"))) > Decimal("0")
+                ]
+            else:
+                await self.init_exchange()
+                positions = await self.ex.fetch_positions(None)
+                if not isinstance(positions, list):
+                    raise RuntimeError("exchange position query did not return a list")
+                for pos in positions:
+                    if self._symbol_matches(str(pos.get("symbol") or ""), symbol):
+                        raw_amount = pos.get("contracts")
+                        if raw_amount is None or not Decimal(str(raw_amount)).is_finite():
+                            raise RuntimeError("exchange returned invalid contracts")
+                remaining_positions = [
+                    {
+                        "symbol": str(pos.get("symbol") or symbol),
+                        "position_side": str(pos.get("side") or "unknown"),
+                        "amount": str(pos.get("contracts", "unknown")),
+                    }
+                    for pos in positions
+                    if self._symbol_matches(str(pos.get("symbol") or ""), symbol)
+                    and safe_decimal(pos.get("contracts")) > Decimal("0")
+                ]
+        except Exception as exc:
+            verification_error = str(exc)
+
+        if verification_error:
+            status = "position_unknown"
+        elif remaining_positions:
+            status = "position_remaining"
+        elif cancel_errors:
+            status = "cleanup_incomplete"
+        else:
+            status = "success"
 
         return {
-            "status": "success" if not cancel_errors else "cleanup_incomplete",
+            "status": status,
             "close_order_id": close_order.get("id"),
             "close_mode": close_mode,
+            "close_error": close_error,
+            "position_verified_zero": verification_error is None and not remaining_positions,
+            "verification_source": "binance_position_risk" if self.exchange_id == "binanceusdm" else "exchange_positions_full_scan",
+            "verification_error": verification_error,
+            "remaining_positions": remaining_positions,
             "cancelled_protection_order_ids": cancelled_ids,
             "cancel_errors": cancel_errors,
         }
@@ -2802,7 +2863,7 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
             return json.dumps(
                 {
                     "status": "rolled_back" if rollback_ok else "error",
-                    "error_code": "ATOMIC_PROTECTION_FAILED" if rollback_ok else "ATOMIC_ROLLBACK_FAILED",
+                    "error_code": "ATOMIC_PROTECTION_FAILED" if rollback_ok else "ATOMIC_ROLLBACK_UNVERIFIED",
                     "execution_mode": "live",
                     "order_id": order.get("id"),
                     "sl_order_id": sl_order_id,

@@ -1943,20 +1943,24 @@ class ExecutionEngine:
                 positions = await self.ex.fetch_positions(None)
                 if not isinstance(positions, list):
                     raise RuntimeError("exchange position query did not return a list")
-                for pos in positions:
-                    if self._symbol_matches(str(pos.get("symbol") or ""), symbol):
-                        raw_amount = pos.get("contracts")
-                        if raw_amount is None or not Decimal(str(raw_amount)).is_finite():
-                            raise RuntimeError("exchange returned invalid contracts")
+                matching = [
+                    pos for pos in positions
+                    if self._symbol_matches(str(pos.get("symbol") or ""), symbol)
+                ]
+                if not matching:
+                    raise RuntimeError("exchange positions did not return the requested symbol")
+                for pos in matching:
+                    raw_amount = pos.get("contracts")
+                    if raw_amount is None or not Decimal(str(raw_amount)).is_finite():
+                        raise RuntimeError("exchange returned invalid contracts")
                 remaining_positions = [
                     {
                         "symbol": str(pos.get("symbol") or symbol),
                         "position_side": str(pos.get("side") or "unknown"),
                         "amount": str(pos.get("contracts", "unknown")),
                     }
-                    for pos in positions
-                    if self._symbol_matches(str(pos.get("symbol") or ""), symbol)
-                    and safe_decimal(pos.get("contracts")) > Decimal("0")
+                    for pos in matching
+                    if abs(safe_decimal(pos.get("contracts"))) > Decimal("0")
                 ]
         except Exception as exc:
             verification_error = str(exc)

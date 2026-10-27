@@ -329,6 +329,40 @@ async def test_atomic_rollback_never_reports_success_without_zero_position(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("positions", "expected_status"),
+    [
+        ([], "position_unknown"),
+        ([{"symbol": "ETH/USDT", "contracts": "0"}], "success"),
+        ([{"symbol": "ETH/USDT", "contracts": "-0.2"}], "position_remaining"),
+    ],
+)
+async def test_atomic_rollback_generic_exchange_requires_explicit_zero_position(
+    monkeypatch: pytest.MonkeyPatch, positions: list[dict], expected_status: str,
+) -> None:
+    engine = execution_server.ExecutionEngine()
+    engine.exchange_id = "other"
+
+    class FakeExchange:
+        async def fetch_positions(self, symbols):
+            assert symbols is None
+            return positions
+
+    async def fake_init_exchange():
+        engine.ex = FakeExchange()
+
+    async def fake_close(**kwargs):
+        return {"id": "close-1"}, "reduce_only"
+
+    monkeypatch.setattr(engine, "init_exchange", fake_init_exchange)
+    monkeypatch.setattr(engine, "_submit_market_close_order", fake_close)
+    result = await engine._rollback_unprotected_entry("ETH/USDT", "buy", "0.5", [])
+
+    assert result["status"] == expected_status
+    assert result["position_verified_zero"] is (expected_status == "success")
+
+
+@pytest.mark.asyncio
 async def test_atomic_rollback_timeout_checks_position_without_second_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

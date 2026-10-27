@@ -113,6 +113,24 @@ async def test_recovery_position_snapshot_never_hides_invalid_or_signed_position
         assert len(result["data"]) == expected_count
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [None, {}, {"orders": None}, {"orders": [None]}])
+async def test_algo_order_query_rejects_incomplete_responses(response: object) -> None:
+    recovery_engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        @staticmethod
+        def market_id(symbol: str) -> str:
+            return "ETHUSDT"
+
+        async def fapiPrivateGetOpenAlgoOrders(self, params: dict[str, str]) -> object:
+            return response
+
+    recovery_engine.ex = FakeExchange()
+    with pytest.raises(RuntimeError):
+        await recovery_engine._fetch_open_algo_orders("ETH/USDT")
+
+
 def test_nullable_leverage_uses_configured_safety_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STRATEGY_MAX_LEVERAGE", "3")
 

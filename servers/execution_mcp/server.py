@@ -504,10 +504,12 @@ class ExecutionEngine:
             response = await self.ex.request("openAlgoOrders", "fapiPrivate", "GET", params)
 
         rows = response.get("orders") if isinstance(response, dict) else response
+        if not isinstance(rows, list):
+            raise RuntimeError("Algo open-order query did not return an orders list")
         normalized: list[dict] = []
-        for raw in rows or []:
+        for raw in rows:
             if not isinstance(raw, dict):
-                continue
+                raise RuntimeError("Algo open-order query returned an invalid order")
             info = dict(raw)
             algo_id = raw.get("algoId") or raw.get("strategyId") or raw.get("orderId")
             client_id = raw.get("clientAlgoId") or raw.get("newClientStrategyId") or raw.get("clientOrderId")

@@ -504,10 +504,12 @@ class ExecutionEngine:
             response = await self.ex.request("openAlgoOrders", "fapiPrivate", "GET", params)
 
         rows = response.get("orders") if isinstance(response, dict) else response
+        if not isinstance(rows, list):
+            raise RuntimeError("Algo open-order query did not return an orders list")
         normalized: list[dict] = []
-        for raw in rows or []:
+        for raw in rows:
             if not isinstance(raw, dict):
-                continue
+                raise RuntimeError("Algo open-order query returned an invalid order")
             info = dict(raw)
             algo_id = raw.get("algoId") or raw.get("strategyId") or raw.get("orderId")
             client_id = raw.get("clientAlgoId") or raw.get("newClientStrategyId") or raw.get("clientOrderId")
@@ -1899,6 +1901,9 @@ class ExecutionEngine:
                     cancel_errors.append(f"{order_id}: standard={standard_exc}; algo={algo_exc}")
 
         close_side = "buy" if str(entry_side).lower() == "sell" else "sell"
+        close_order: dict = {}
+        close_mode: str | None = None
+        close_error: str | None = None
         try:
             close_order, close_mode = await self._submit_market_close_order(
                 symbol=symbol,
@@ -1907,17 +1912,79 @@ class ExecutionEngine:
                 position_side=None,
             )
         except Exception as exc:
-            return {
-                "status": "error",
-                "message": str(exc),
-                "cancelled_protection_order_ids": cancelled_ids,
-                "cancel_errors": cancel_errors,
-            }
+            # A timeout can occur after the exchange accepted the order. Inspect the
+            # position before any caller considers a retry, to avoid a second close.
+            close_error = str(exc)
+
+        remaining_positions: list[dict] = []
+        verification_error: str | None = None
+        try:
+            if self.exchange_id == "binanceusdm":
+                positions = await self._fetch_binance_usdm_positions_direct(symbol)
+                matching = [
+                    pos for pos in positions
+                    if self._symbol_matches(str(pos.get("symbol") or ""), symbol)
+                ]
+                if not matching:
+                    raise RuntimeError("positionRisk did not return the requested symbol")
+                for pos in matching:
+                    raw_amount = pos.get("positionAmt")
+                    if raw_amount is None or not Decimal(str(raw_amount)).is_finite():
+                        raise RuntimeError("positionRisk returned an invalid positionAmt")
+                remaining_positions = [
+                    {
+                        "symbol": str(pos.get("symbol") or symbol),
+                        "position_side": str(pos.get("positionSide") or "BOTH"),
+                        "amount": str(pos.get("positionAmt", "unknown")),
+                    }
+                    for pos in matching
+                    if abs(safe_decimal(pos.get("positionAmt"))) > Decimal("0")
+                ]
+            else:
+                await self.init_exchange()
+                positions = await self.ex.fetch_positions(None)
+                if not isinstance(positions, list):
+                    raise RuntimeError("exchange position query did not return a list")
+                matching = [
+                    pos for pos in positions
+                    if self._symbol_matches(str(pos.get("symbol") or ""), symbol)
+                ]
+                if not matching:
+                    raise RuntimeError("exchange positions did not return the requested symbol")
+                for pos in matching:
+                    raw_amount = pos.get("contracts")
+                    if raw_amount is None or not Decimal(str(raw_amount)).is_finite():
+                        raise RuntimeError("exchange returned invalid contracts")
+                remaining_positions = [
+                    {
+                        "symbol": str(pos.get("symbol") or symbol),
+                        "position_side": str(pos.get("side") or "unknown"),
+                        "amount": str(pos.get("contracts", "unknown")),
+                    }
+                    for pos in matching
+                    if abs(safe_decimal(pos.get("contracts"))) > Decimal("0")
+                ]
+        except Exception as exc:
+            verification_error = str(exc)
+
+        if verification_error:
+            status = "position_unknown"
+        elif remaining_positions:
+            status = "position_remaining"
+        elif cancel_errors:
+            status = "cleanup_incomplete"
+        else:
+            status = "success"
 
         return {
-            "status": "success" if not cancel_errors else "cleanup_incomplete",
+            "status": status,
             "close_order_id": close_order.get("id"),
             "close_mode": close_mode,
+            "close_error": close_error,
+            "position_verified_zero": verification_error is None and not remaining_positions,
+            "verification_source": "binance_position_risk" if self.exchange_id == "binanceusdm" else "exchange_positions_full_scan",
+            "verification_error": verification_error,
+            "remaining_positions": remaining_positions,
             "cancelled_protection_order_ids": cancelled_ids,
             "cancel_errors": cancel_errors,
         }
@@ -2330,11 +2397,18 @@ async def get_all_position_snapshots() -> str:
     try:
         await engine.init_exchange()
         positions = await engine.ex.fetch_positions(None)
+        if not isinstance(positions, list):
+            raise RuntimeError("exchange position query did not return a list")
         snapshots: list[dict] = []
 
-        for position in positions or []:
-            contracts = safe_decimal(position.get("contracts", 0))
-            if contracts <= Decimal("0"):
+        for position in positions:
+            if not isinstance(position, dict):
+                raise RuntimeError("exchange returned an invalid position")
+            raw_contracts = position.get("contracts")
+            if raw_contracts is None or not Decimal(str(raw_contracts)).is_finite():
+                raise RuntimeError("exchange returned invalid contracts")
+            contracts = abs(safe_decimal(raw_contracts))
+            if contracts == Decimal("0"):
                 continue
 
             entry_price = safe_decimal(position.get("entryPrice", position.get("entry_price", 0)))
@@ -2426,6 +2500,51 @@ async def get_protection_snapshot(symbol: str) -> str:
     except Exception as e:
         logger.exception("获取保护单快照失败")
         return MCPErrorResponse(status="error", error_code="PROTECTION_QUERY_FAILED", message=str(e)).model_dump_json()
+
+
+@mcp.tool()
+async def get_open_orders_snapshot(symbol: str) -> str:
+    """Read both ordinary and Algo orders for one USD-M symbol before resuming entries."""
+    try:
+        requested_symbol = str(symbol or "").strip()
+        if not requested_symbol:
+            raise ValueError("symbol is required")
+        if engine.exchange_id != "binanceusdm":
+            raise RuntimeError("complete open-order recovery check is only supported for Binance USD-M")
+        await engine.init_exchange()
+        market = engine.ex.market(requested_symbol)
+        resolved_symbol = str(market.get("symbol") or "") if isinstance(market, dict) else ""
+        if not engine._symbol_matches(resolved_symbol, requested_symbol):
+            raise RuntimeError("exchange market did not resolve the requested symbol")
+
+        regular_orders = await engine.ex.fetch_open_orders(resolved_symbol)
+        algo_orders = await engine._fetch_open_algo_orders(resolved_symbol)
+        if not isinstance(regular_orders, list) or not isinstance(algo_orders, list):
+            raise RuntimeError("exchange open-order query did not return complete lists")
+        for order in [*regular_orders, *algo_orders]:
+            if not isinstance(order, dict) or not engine._symbol_matches(
+                str(order.get("symbol") or resolved_symbol), requested_symbol,
+            ):
+                raise RuntimeError("exchange returned an invalid or mismatched open order")
+
+        return json.dumps(
+            {
+                "status": "success",
+                "data": {
+                    "symbol": resolved_symbol,
+                    "regular_count": len(regular_orders),
+                    "algo_count": len(algo_orders),
+                    "open_order_count": len(regular_orders) + len(algo_orders),
+                    "verification_source": "binance_usdm_regular_and_algo",
+                },
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        logger.warning("恢复前挂单查询失败: symbol=%s error=%s", symbol, exc)
+        return MCPErrorResponse(
+            status="error", error_code="OPEN_ORDERS_QUERY_FAILED", message=str(exc),
+        ).model_dump_json()
 
 @mcp.tool()
 async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_type: str = 'market', price: float = None, sl_price: float = None, tp_price: float = None, volatility: float = 0.0, leverage: float = 3.0) -> str:
@@ -2802,7 +2921,7 @@ async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_t
             return json.dumps(
                 {
                     "status": "rolled_back" if rollback_ok else "error",
-                    "error_code": "ATOMIC_PROTECTION_FAILED" if rollback_ok else "ATOMIC_ROLLBACK_FAILED",
+                    "error_code": "ATOMIC_PROTECTION_FAILED" if rollback_ok else "ATOMIC_ROLLBACK_UNVERIFIED",
                     "execution_mode": "live",
                     "order_id": order.get("id"),
                     "sl_order_id": sl_order_id,

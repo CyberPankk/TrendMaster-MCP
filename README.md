@@ -9,6 +9,12 @@
 
 ---
 
+## 当前集成与测试约束
+
+`servers/execution_mcp/server.py` 当前作为 `TrendMasterMVP` 的子模块运行，导入宿主仓库的 `shared/shadow_ledger.py` 和 `shared/db_manager.py`。仅克隆本仓库不能独立启动该服务或运行执行层测试。正式镜像将两个仓库放在同一 `/app` 目录下，并设置 `PYTHONPATH=/app`。
+
+验证执行层时，应使用应用仓库固定的子模块提交和宿主 `shared/` 文件；发布必须固定应用仓库中的 gitlink SHA，不以远端默认分支或 `git submodule update --remote` 的结果代替。测试只用假交易所，不会证明真实交易所持仓或交易收益。
+
 ## 🌟 中文说明
 
 **TrendMaster-MCP** 是一个专为 Web3 与 Crypto 市场设计的下一代量化交易系统底座。它彻底抛弃了传统量化中僵化的 `if-else` 策略流，全面拥抱 **Quant 4.0 理念**：将大语言模型（LLM）作为中枢大脑，通过标准的 [Model Context Protocol (MCP)](https://anthropic.com/mcp) 动态拉取（Pull）独立运行的底层算力微服务。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -11,6 +12,105 @@ SERVER_DIR = Path(__file__).resolve().parents[1] / "servers" / "execution_mcp"
 sys.path.insert(0, str(SERVER_DIR))
 
 import server as execution_server  # noqa: E402
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("regular", "algo", "expected_count"),
+    [([], [], 0), ([{"symbol": "ETH/USDT:USDT", "id": "regular-1"}], [], 1),
+     ([], [{"symbol": "ETH/USDT:USDT", "id": "algo-1"}], 1)],
+)
+async def test_recovery_open_order_snapshot_checks_both_endpoints(
+    monkeypatch: pytest.MonkeyPatch, regular: list[dict], algo: list[dict], expected_count: int,
+) -> None:
+    recovery_engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        def market(self, symbol: str) -> dict:
+            assert symbol == "ETH/USDT"
+            return {"symbol": "ETH/USDT:USDT"}
+
+        async def fetch_open_orders(self, symbol: str) -> list[dict]:
+            assert symbol == "ETH/USDT:USDT"
+            return regular
+
+    async def fake_init() -> None:
+        recovery_engine.ex = FakeExchange()
+
+    async def fake_algo(symbol: str) -> list[dict]:
+        assert symbol == "ETH/USDT:USDT"
+        return algo
+
+    monkeypatch.setattr(recovery_engine, "init_exchange", fake_init)
+    monkeypatch.setattr(recovery_engine, "_fetch_open_algo_orders", fake_algo)
+    monkeypatch.setattr(execution_server, "engine", recovery_engine)
+    result = json.loads(await execution_server.get_open_orders_snapshot("ETH/USDT"))
+
+    assert result["status"] == "success"
+    assert result["data"]["open_order_count"] == expected_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_endpoint", ["regular", "algo"])
+async def test_recovery_open_order_snapshot_fails_closed_on_query_error(
+    monkeypatch: pytest.MonkeyPatch, failed_endpoint: str,
+) -> None:
+    recovery_engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        def market(self, symbol: str) -> dict:
+            return {"symbol": "ETH/USDT:USDT"}
+
+        async def fetch_open_orders(self, symbol: str) -> list[dict]:
+            if failed_endpoint == "regular":
+                raise TimeoutError("regular orders unavailable")
+            return []
+
+    async def fake_init() -> None:
+        recovery_engine.ex = FakeExchange()
+
+    async def fake_algo(symbol: str) -> list[dict]:
+        if failed_endpoint == "algo":
+            raise TimeoutError("algo orders unavailable")
+        return []
+
+    monkeypatch.setattr(recovery_engine, "init_exchange", fake_init)
+    monkeypatch.setattr(recovery_engine, "_fetch_open_algo_orders", fake_algo)
+    monkeypatch.setattr(execution_server, "engine", recovery_engine)
+    result = json.loads(await execution_server.get_open_orders_snapshot("ETH/USDT"))
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "OPEN_ORDERS_QUERY_FAILED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("positions", "expected_status", "expected_count"),
+    [([], "success", 0), ([{"symbol": "ETH/USDT:USDT", "contracts": "-0.2"}], "success", 1),
+     ([{"symbol": "ETH/USDT:USDT", "contracts": None}], "error", None),
+     (None, "error", None)],
+)
+async def test_recovery_position_snapshot_never_hides_invalid_or_signed_positions(
+    monkeypatch: pytest.MonkeyPatch, positions: list[dict] | None,
+    expected_status: str, expected_count: int | None,
+) -> None:
+    recovery_engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        async def fetch_positions(self, symbols):
+            assert symbols is None
+            return positions
+
+    async def fake_init() -> None:
+        recovery_engine.ex = FakeExchange()
+
+    monkeypatch.setattr(recovery_engine, "init_exchange", fake_init)
+    monkeypatch.setattr(execution_server, "engine", recovery_engine)
+    result = json.loads(await execution_server.get_all_position_snapshots())
+
+    assert result["status"] == expected_status
+    if expected_count is not None:
+        assert len(result["data"]) == expected_count
 
 
 def test_nullable_leverage_uses_configured_safety_cap(monkeypatch: pytest.MonkeyPatch) -> None:

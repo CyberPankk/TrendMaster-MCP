@@ -2395,11 +2395,18 @@ async def get_all_position_snapshots() -> str:
     try:
         await engine.init_exchange()
         positions = await engine.ex.fetch_positions(None)
+        if not isinstance(positions, list):
+            raise RuntimeError("exchange position query did not return a list")
         snapshots: list[dict] = []
 
-        for position in positions or []:
-            contracts = safe_decimal(position.get("contracts", 0))
-            if contracts <= Decimal("0"):
+        for position in positions:
+            if not isinstance(position, dict):
+                raise RuntimeError("exchange returned an invalid position")
+            raw_contracts = position.get("contracts")
+            if raw_contracts is None or not Decimal(str(raw_contracts)).is_finite():
+                raise RuntimeError("exchange returned invalid contracts")
+            contracts = abs(safe_decimal(raw_contracts))
+            if contracts == Decimal("0"):
                 continue
 
             entry_price = safe_decimal(position.get("entryPrice", position.get("entry_price", 0)))
@@ -2491,6 +2498,51 @@ async def get_protection_snapshot(symbol: str) -> str:
     except Exception as e:
         logger.exception("获取保护单快照失败")
         return MCPErrorResponse(status="error", error_code="PROTECTION_QUERY_FAILED", message=str(e)).model_dump_json()
+
+
+@mcp.tool()
+async def get_open_orders_snapshot(symbol: str) -> str:
+    """Read both ordinary and Algo orders for one USD-M symbol before resuming entries."""
+    try:
+        requested_symbol = str(symbol or "").strip()
+        if not requested_symbol:
+            raise ValueError("symbol is required")
+        if engine.exchange_id != "binanceusdm":
+            raise RuntimeError("complete open-order recovery check is only supported for Binance USD-M")
+        await engine.init_exchange()
+        market = engine.ex.market(requested_symbol)
+        resolved_symbol = str(market.get("symbol") or "") if isinstance(market, dict) else ""
+        if not engine._symbol_matches(resolved_symbol, requested_symbol):
+            raise RuntimeError("exchange market did not resolve the requested symbol")
+
+        regular_orders = await engine.ex.fetch_open_orders(resolved_symbol)
+        algo_orders = await engine._fetch_open_algo_orders(resolved_symbol)
+        if not isinstance(regular_orders, list) or not isinstance(algo_orders, list):
+            raise RuntimeError("exchange open-order query did not return complete lists")
+        for order in [*regular_orders, *algo_orders]:
+            if not isinstance(order, dict) or not engine._symbol_matches(
+                str(order.get("symbol") or resolved_symbol), requested_symbol,
+            ):
+                raise RuntimeError("exchange returned an invalid or mismatched open order")
+
+        return json.dumps(
+            {
+                "status": "success",
+                "data": {
+                    "symbol": resolved_symbol,
+                    "regular_count": len(regular_orders),
+                    "algo_count": len(algo_orders),
+                    "open_order_count": len(regular_orders) + len(algo_orders),
+                    "verification_source": "binance_usdm_regular_and_algo",
+                },
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        logger.warning("恢复前挂单查询失败: symbol=%s error=%s", symbol, exc)
+        return MCPErrorResponse(
+            status="error", error_code="OPEN_ORDERS_QUERY_FAILED", message=str(exc),
+        ).model_dump_json()
 
 @mcp.tool()
 async def execute_smart_order(symbol: str, side: str, amount_usd: float, order_type: str = 'market', price: float = None, sl_price: float = None, tp_price: float = None, volatility: float = 0.0, leverage: float = 3.0) -> str:

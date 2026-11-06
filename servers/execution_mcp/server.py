@@ -13,7 +13,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import aiohttp
 import ccxt.async_support as ccxt
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 # 禁用 ccxt 和 aiohttp 在退出时的烦人警告
 try:
@@ -650,6 +650,120 @@ class ExecutionEngine:
             "fee": fallback_fee,
             "source": "create_order_fallback",
         }
+
+    async def _resolve_close_receipt(self, symbol: str, order: dict) -> dict:
+        """Build a verified close receipt from exchange user trades.
+
+        The application risk budget must never infer realised PnL from entry and
+        exit prices.  A receipt is therefore verified only when every matched
+        exchange fill exposes a stable trade id, realised PnL, USDT commission,
+        and timestamp.  Incomplete receipts remain observable but are not safe
+        inputs for automatic loss limits.
+        """
+        order_id = str(order.get("id") or order.get("order_id") or "").strip()
+        receipt_base = {
+            "verified": False,
+            "source": "binance_user_trades",
+            "symbol": str(symbol or ""),
+            "order_id": order_id,
+        }
+        if not order_id:
+            return {**receipt_base, "reason": "missing_exchange_order_id"}
+
+        attempts = max(1, int(os.getenv("CLOSE_RECEIPT_RECONCILE_ATTEMPTS", "4") or 4))
+        delay_sec = max(0.0, float(os.getenv("CLOSE_RECEIPT_RECONCILE_DELAY_SEC", "0.15") or 0.15))
+        last_reason = "close_fills_not_found"
+        for attempt in range(1, attempts + 1):
+            try:
+                trades = await self.ex.fetch_my_trades(symbol, None, 100, {"orderId": order_id})
+            except Exception as exc:
+                trades = []
+                last_reason = f"user_trades_unavailable:{type(exc).__name__}"
+
+            matched = [
+                trade for trade in (trades or [])
+                if str(trade.get("order") or trade.get("orderId") or "") == order_id
+            ]
+            if matched:
+                fills: list[dict] = []
+                invalid_reason = ""
+                for trade in matched:
+                    info = trade.get("info") if isinstance(trade.get("info"), dict) else {}
+                    trade_id = str(
+                        trade.get("id") or info.get("id") or info.get("tradeId") or ""
+                    ).strip()
+                    realized_raw = (
+                        info.get("realizedPnl")
+                        if info.get("realizedPnl") is not None
+                        else trade.get("realizedPnl")
+                    )
+                    fee = trade.get("fee") if isinstance(trade.get("fee"), dict) else {}
+                    commission_raw = (
+                        info.get("commission")
+                        if info.get("commission") is not None
+                        else fee.get("cost")
+                    )
+                    commission_asset = str(
+                        info.get("commissionAsset") or fee.get("currency") or ""
+                    ).upper()
+                    timestamp_raw = trade.get("timestamp") or info.get("time")
+                    try:
+                        realized = Decimal(str(realized_raw))
+                        commission = Decimal(str(commission_raw))
+                        timestamp_ms = int(timestamp_raw)
+                        if not realized.is_finite() or not commission.is_finite():
+                            raise ValueError("non-finite close receipt amount")
+                    except (InvalidOperation, TypeError, ValueError):
+                        invalid_reason = "invalid_close_fill_amount_or_timestamp"
+                        break
+                    if not trade_id:
+                        invalid_reason = "missing_exchange_trade_id"
+                        break
+                    if commission < 0:
+                        invalid_reason = "negative_commission"
+                        break
+                    if commission_asset != "USDT":
+                        invalid_reason = "commission_not_usdt"
+                        break
+                    fills.append(
+                        {
+                            "trade_id": trade_id,
+                            "realized_pnl_usdt": str(realized),
+                            "commission_usdt": str(commission),
+                            "timestamp_ms": timestamp_ms,
+                        }
+                    )
+
+                if invalid_reason:
+                    return {**receipt_base, "reason": invalid_reason, "fill_count": len(matched)}
+                if fills:
+                    realized_total = sum(
+                        (Decimal(fill["realized_pnl_usdt"]) for fill in fills), Decimal("0")
+                    )
+                    commission_total = sum(
+                        (Decimal(fill["commission_usdt"]) for fill in fills), Decimal("0")
+                    )
+                    market_id = ""
+                    try:
+                        market_id = str(self.ex.market_id(symbol) or "")
+                    except Exception:
+                        market_id = str(symbol or "").replace("/", "").replace(":USDT", "")
+                    return {
+                        **receipt_base,
+                        "verified": True,
+                        "receipt_id": f"binanceusdm:{market_id}:{order_id}",
+                        "realized_pnl_usdt": str(realized_total),
+                        "commission_usdt": str(commission_total),
+                        "net_pnl_usdt": str(realized_total - commission_total),
+                        "timestamp_ms": max(fill["timestamp_ms"] for fill in fills),
+                        "fill_count": len(fills),
+                        "fills": fills,
+                    }
+
+            if attempt < attempts:
+                await asyncio.sleep(delay_sec)
+
+        return {**receipt_base, "reason": last_reason}
 
     async def _fetch_managed_algo_order_symbols(self) -> set[str]:
         """只返回本系统创建的 TM_SL_/TM_TP_ 条件单所属 symbol。"""
@@ -2015,6 +2129,7 @@ class ExecutionEngine:
                 amount_str=amount_str,
                 position_side=position_side,
             )
+            close_receipt = await self._resolve_close_receipt(symbol, order)
             return {
                 "status": "success",
                 "mode": submit_mode,
@@ -2022,6 +2137,7 @@ class ExecutionEngine:
                 "amount": amount_str,
                 "close_side": close_side,
                 "reduce_only_applied": "reduce_only" in submit_mode,
+                "close_receipt": close_receipt,
             }
         except Exception as exc:
             message = str(exc)
@@ -2085,6 +2201,7 @@ class ExecutionEngine:
                 # 此处刚重新读取过真实仓位和精确剩余数量，可安全使用最小参数反向市价单。
                 force_minimal_params=fallback_position_side is None,
             )
+            close_receipt = await self._resolve_close_receipt(execution_symbol, order)
             return {
                 "status": "success",
                 "mode": (
@@ -2096,6 +2213,7 @@ class ExecutionEngine:
                 "amount": refreshed_amount_str,
                 "close_side": fallback_close_side,
                 "reduce_only_applied": "reduce_only" in submit_mode,
+                "close_receipt": close_receipt,
             }
 
     async def close_all_positions(self, symbol: str):
@@ -2111,6 +2229,8 @@ class ExecutionEngine:
         positions, resolved_symbol = await self._fetch_positions_for_symbol(symbol)
         
         closed_count = 0
+        close_results: list[dict] = []
+        close_receipts: list[dict] = []
         for position in positions:
             size = safe_decimal(position.get('contracts', 0))
             if size > Decimal("0"):
@@ -2118,8 +2238,16 @@ class ExecutionEngine:
                 close_result = await self._close_position_with_fallback(execution_symbol, position)
                 logger.info(f"✅ {execution_symbol} 平仓结果: {close_result}")
                 closed_count += 1
+                close_results.append(close_result)
+                receipt = close_result.get("close_receipt")
+                if isinstance(receipt, dict):
+                    close_receipts.append(receipt)
                 
-        return closed_count
+        return {
+            "closed_count": closed_count,
+            "close_results": close_results,
+            "close_receipts": close_receipts,
+        }
 
     async def sync_trailing_stop(self, symbol: str, trailing_pct: float = 0.05, roe_activation: float = 0.05) -> list:
         """
@@ -3295,7 +3423,9 @@ async def kill_all_positions(symbol: str) -> str:
         logger.info(f"已撤销 {symbol} 所有挂单。")
         
         # 2. 平掉所有仓位
-        closed_count = await engine.close_all_positions(symbol)
+        close_summary = await engine.close_all_positions(symbol)
+        closed_count = int(close_summary.get("closed_count", 0) or 0)
+        close_receipts = list(close_summary.get("close_receipts") or [])
         logger.info(f"已平仓 {symbol} 的 {closed_count} 个持仓。")
 
         # 再次复查交易所持仓，避免 symbol 口径异常或交易所拒单时出现“假成功”。
@@ -3347,6 +3477,8 @@ async def kill_all_positions(symbol: str) -> str:
                 "status": "success",
                 "message": result_message,
                 "closed_count": closed_count,
+                "close_receipts": close_receipts,
+                "close_results": close_summary.get("close_results") or [],
                 "resolved_symbol": resolved_symbol,
             },
             ensure_ascii=False,
@@ -3388,6 +3520,8 @@ async def kill_all_positions_global() -> str:
 
         cancelled = 0
         closed = 0
+        close_receipts: list[dict] = []
+        close_results: list[dict] = []
         errors = []
 
         for sym in sorted(symbols):
@@ -3398,8 +3532,10 @@ async def kill_all_positions_global() -> str:
             except Exception as e:
                 errors.append({"symbol": sym, "stage": "cancel_all_orders", "error": str(e)})
             try:
-                c = await engine.close_all_positions(sym)
-                closed += int(c or 0)
+                close_summary = await engine.close_all_positions(sym)
+                closed += int(close_summary.get("closed_count", 0) or 0)
+                close_receipts.extend(close_summary.get("close_receipts") or [])
+                close_results.extend(close_summary.get("close_results") or [])
             except Exception as e:
                 errors.append({"symbol": sym, "stage": "close_all_positions", "error": str(e)})
 
@@ -3454,6 +3590,8 @@ async def kill_all_positions_global() -> str:
                 "symbols_affected": sorted(symbols),
                 "orders_cancelled_symbols": cancelled,
                 "positions_closed_count": closed,
+                "close_receipts": close_receipts,
+                "close_results": close_results,
                 "errors": errors,
                 "remaining_positions": [],
                 "auto_flatten_confirmed": True,

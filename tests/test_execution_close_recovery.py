@@ -170,6 +170,74 @@ async def test_authoritative_fill_prefers_user_trades() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_receipt_uses_exchange_realized_pnl_and_usdt_commission() -> None:
+    engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        @staticmethod
+        def market_id(symbol: str) -> str:
+            assert symbol == "ETH/USDT"
+            return "ETHUSDT"
+
+        async def fetch_my_trades(self, symbol: str, since, limit: int, params: dict[str, object]):
+            assert params == {"orderId": "close-42"}
+            return [
+                {
+                    "id": "fill-1",
+                    "order": "close-42",
+                    "timestamp": 1_700_000_000_100,
+                    "fee": {"cost": "0.10", "currency": "USDT"},
+                    "info": {"realizedPnl": "-4.00", "commission": "0.10", "commissionAsset": "USDT"},
+                },
+                {
+                    "id": "fill-2",
+                    "order": "close-42",
+                    "timestamp": 1_700_000_000_200,
+                    "fee": {"cost": "0.05", "currency": "USDT"},
+                    "info": {"realizedPnl": "1.00", "commission": "0.05", "commissionAsset": "USDT"},
+                },
+            ]
+
+    engine.ex = FakeExchange()
+    receipt = await engine._resolve_close_receipt("ETH/USDT", {"id": "close-42"})
+
+    assert receipt["verified"] is True
+    assert receipt["receipt_id"] == "binanceusdm:ETHUSDT:close-42"
+    assert receipt["realized_pnl_usdt"] == "-3.00"
+    assert receipt["commission_usdt"] == "0.15"
+    assert receipt["net_pnl_usdt"] == "-3.15"
+    assert receipt["timestamp_ms"] == 1_700_000_000_200
+    assert receipt["fill_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_close_receipt_fails_closed_when_realized_pnl_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLOSE_RECEIPT_RECONCILE_ATTEMPTS", "1")
+    engine = execution_server.ExecutionEngine()
+
+    class FakeExchange:
+        async def fetch_my_trades(self, symbol: str, since, limit: int, params: dict[str, object]):
+            return [
+                {
+                    "id": "fill-1",
+                    "order": "close-43",
+                    "timestamp": 1_700_000_000_300,
+                    "fee": {"cost": "0.05", "currency": "USDT"},
+                    "info": {"commission": "0.05", "commissionAsset": "USDT"},
+                }
+            ]
+
+    engine.ex = FakeExchange()
+    receipt = await engine._resolve_close_receipt("ETH/USDT", {"id": "close-43"})
+
+    assert receipt["verified"] is False
+    assert receipt["reason"] == "invalid_close_fill_amount_or_timestamp"
+    assert "net_pnl_usdt" not in receipt
+
+
+@pytest.mark.asyncio
 async def test_cancel_order_by_kind_uses_algo_endpoint() -> None:
     engine = execution_server.ExecutionEngine()
     calls: list[dict[str, object]] = []
@@ -621,7 +689,9 @@ def test_reduce_only_rejection_refreshes_then_uses_minimal_one_way_close(
     assert submit_calls[1]["position_side"] is None
     assert submit_calls[1]["force_minimal_params"] is True
     assert submit_calls[1]["amount_str"] == "0.0123"
-    assert result == {
+    assert {key: result[key] for key in (
+        "status", "mode", "order_id", "amount", "close_side", "reduce_only_applied",
+    )} == {
         "status": "success",
         "mode": "cancel_all_refresh_no_reduce_only_fallback",
         "order_id": "close-order-1",
@@ -629,3 +699,5 @@ def test_reduce_only_rejection_refreshes_then_uses_minimal_one_way_close(
         "close_side": "sell",
         "reduce_only_applied": False,
     }
+    assert result["close_receipt"]["verified"] is False
+    assert result["close_receipt"]["order_id"] == "close-order-1"
